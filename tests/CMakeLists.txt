@@ -1,0 +1,8 @@
+add_executable(buildindex buildindex.cpp)
+add_executable(buildindex-quadtree buildindex-quadtree.cpp)
+add_executable(search_multi-zorder search_multi-zorder.cpp)
+add_executable(search_multi-quadtree search_multi-quadtree.cpp)
+add_executable(search_multi-zorder-label search_multi-zorder-label.cpp)
+add_executable(search_multi-or-json search_multi-or-json.cpp)
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")

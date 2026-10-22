@@ -1,0 +1,32 @@
+# Local CMake builds and generated files
+/build/
+/build-*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+
+# Local datasets, generated indexes, and benchmark output
+/data/
+/indexes/
+/results/
+*.qidx
+
+# Editor settings and local credentials
+/.idea/
+/.vscode/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
