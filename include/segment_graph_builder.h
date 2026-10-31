@@ -2,8 +2,8 @@
 
 #include <thread>
 #include <map>
-#include "utils.h"
-#include "searcher.hpp"
+#include "segment_tree_utils.h"
+#include "search_containers.h"
 #include <bitset>
 
 namespace iPreGraph

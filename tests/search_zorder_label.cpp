@@ -2,8 +2,8 @@
 // Base rows must be ordered by (Morton code, label), matching the saved index.
 // The driver uses three columns: label in column zero, then two numerical values.
 
-#include "iRG_search_multi.h"
-#include "iRG_search_zorder_label.h"
+#include "search_multi.h"
+#include "search_zorder_label.h"
 
 std::unordered_map<std::string, std::string> paths;
 

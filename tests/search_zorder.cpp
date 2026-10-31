@@ -3,7 +3,7 @@
 // Select --method irange to use probabilistic iRangeGraph traversal.
 // --attr_num controls numerical attribute count and defaults to two.
 
-#include "iRG_search_zorder.h"
+#include "search_zorder.h"
 
 std::unordered_map<std::string, std::string> paths;
 

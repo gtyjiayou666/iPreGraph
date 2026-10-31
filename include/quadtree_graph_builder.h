@@ -1,7 +1,7 @@
 #pragma once
 
 // Bottom-up construction for the quadtree's approximate RNG-style graphs.
-// The merge follows construction.h: search an already merged graph, combine
+// The merge follows segment_graph_builder.h: search an already merged graph, combine
 // candidates with inherited child edges, then add/prune reverse edges. Child
 // phases have barriers, so no search reads a graph row while it is modified.
 #include <algorithm>

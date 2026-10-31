@@ -1,22 +1,22 @@
 #pragma once
 
 #include <vector>
-#include "utils_multi.h"
-#include "searcher.hpp"
-#include "memory.hpp"
+#include "multi_attribute_utils.h"
+#include "search_containers.h"
+#include "memory_utils.h"
 #include <bitset>
 #include <stack>
 #include <cmath>
 #include <climits>
 
 // ============================================================================
-// iRG_search_zorder_label.h —— (z-order, label) 字典序变体
+// search_zorder_label.h —— (z-order, label) 字典序变体
 //
 // 数据组织：数据点先按数值属性的 z-order 码升序排列；相同 z 码的点再按标签升序
-// 排列，即全局顺序为 (z_code, label) 字典序（与 iRG_search_mixed.h 的
+// 排列，即全局顺序为 (z_code, label) 字典序（与 search_mixed.h 的
 // (label, z_code) 顺序相反）。因此：
 //   - 数值范围谓词对应数组上的一个连续 z 区间 [z_min, z_max]（用 lower_bound /
-//     upper_bound 定位，与 iRG_search_zorder.h 完全一致）；
+//     upper_bound 定位，与 search_zorder.h 完全一致）；
 //   - 同一标签的点散布在各 z 组内（不连续），标签约束只能在检索过程中用
 //     点级过滤 + 节点级标签位图剪枝解决。
 // 树节点（TreeNodeZLabel）在 MBR 之外新增 label_bmp（节点范围内出现过的标签
@@ -29,7 +29,7 @@
 
 namespace iPreGraph_multi
 {
-    // utils.h 中 tableint / linklistsizeint 定义于 iPreGraph 命名空间，这里引入以便裸用
+    // segment_tree_utils.h 中 tableint / linklistsizeint 定义于 iPreGraph 命名空间，这里引入以便裸用
     using iPreGraph::linklistsizeint;
     using iPreGraph::tableint;
 
@@ -568,7 +568,7 @@ namespace iPreGraph_multi
         }
 
         // ------------------------------------------------------------------------
-        // 边选择（镜像 iRG_search_zorder.h 的 SelectEdgeHybrid，剪枝改为
+        // 边选择（镜像 search_zorder.h 的 SelectEdgeHybrid，剪枝改为
         // NodePruneZLabel = 标签位图 + 数值 MBR 联合剪枝）：
         // 沿树下降到 [ql,qr] 内，兄弟子树被剪掉则继续沿 pid 子树下潜；
         // 收集邻居时用 filter_ids_map（标签命中 AND 数值命中）过滤。
@@ -658,7 +658,7 @@ namespace iPreGraph_multi
         }
 
         // ------------------------------------------------------------------------
-        // DFS（镜像 iRG_search_zorder.h 的 DFS，剪枝改为 NodePruneZLabel）：
+        // DFS（镜像 search_zorder.h 的 DFS，剪枝改为 NodePruneZLabel）：
         // 沿邻接表向下再探索两层，只收集"标签命中 + 数值命中"的点。
         // ------------------------------------------------------------------------
         void DFSZLabel(int pid, int ql, int qr, int edge_limit, int deep,
@@ -749,7 +749,7 @@ namespace iPreGraph_multi
         }
 
         // ------------------------------------------------------------------------
-        // 单区间 top-down 检索（镜像 iRG_search_zorder.h 的
+        // 单区间 top-down 检索（镜像 search_zorder.h 的
         // TopDown_nodeentries_search_zorder_and，进入点/邻居走 SelectEdgeZLabel +
         // DFSZLabel 的标签+数值联合剪枝）。
         // ------------------------------------------------------------------------

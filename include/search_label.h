@@ -1,9 +1,9 @@
 #pragma once
 
 #include <vector>
-#include "utils.h"
-#include "searcher.hpp"
-#include "memory.hpp"
+#include "segment_tree_utils.h"
+#include "search_containers.h"
+#include "memory_utils.h"
 #include <bitset>
 #include <stack>
 #include <cmath>
@@ -242,7 +242,7 @@ namespace iPreGraph
 
         ~iPreGraph_Search_Label()
         {
-            free(data_memory_);
+            memory::aligned_free(data_memory_);
             data_memory_ = nullptr;
         }
 

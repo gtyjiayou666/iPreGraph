@@ -3,7 +3,8 @@
 #include <vector>
 #include <stdint.h>
 #include <stdlib.h>
-#include "memory.hpp"
+#include <stdexcept>
+#include "memory_utils.h"
 
 namespace searcher
 {
@@ -12,18 +13,24 @@ namespace searcher
     {
     private:
         constexpr static int block_size = sizeof(Block) * 8;
-        int nbytes;
+        size_t nbytes;
+        static size_t bytes_for(int n)
+        {
+            if (n < 0)
+                throw std::invalid_argument("bitset size must be non-negative");
+            return (static_cast<size_t>(n) + block_size - 1) / block_size * sizeof(Block);
+        }
         Block *data;
 
     public:
         explicit Bitset(int n)
-            : nbytes((n + block_size - 1) / block_size * sizeof(Block)),
-              data(static_cast<uint64_t *>(memory::align_mm<64>(nbytes)))
+            : nbytes(bytes_for(n)),
+              data(static_cast<Block *>(memory::align_mm<64>(nbytes)))
         {
             std::memset(data, 0, nbytes);
         }
 
-        ~Bitset() { free(data); }
+        ~Bitset() { memory::aligned_free(data); }
 
         void set(int i)
         {

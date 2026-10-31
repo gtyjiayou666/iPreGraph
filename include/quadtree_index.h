@@ -58,7 +58,7 @@ namespace iPreGraph
 
     float GetTime(timeval &begin, timeval &end)
     {
-        return end.tv_sec - begin.tv_sec + (end.tv_usec - begin.tv_usec) * 1.0 / CLOCKS_PER_SEC;
+        return end.tv_sec - begin.tv_sec + (end.tv_usec - begin.tv_usec) * 1.0 / 1000000.0;
     }
     struct QuadConfig
     {
@@ -525,7 +525,7 @@ namespace iPreGraph
 
     private:
         // Same get/set semantics as searcher::Bitset, with portable allocation:
-        // searcher.hpp depends on the legacy Linux-only memory.hpp.
+        // search_containers.h depends on the legacy Linux-only memory_utils.h.
         class QueryVisited
         {
             std::vector<uint64_t> words_;
@@ -557,7 +557,7 @@ namespace iPreGraph
             dist_func_param_ = space_->get_dist_func_param();
         }
         // Heap control follows iPreGraph; direct selection is followed by the
-        // two-hop cross-range DFS from iRG_search_zorder.h, on quadtree paths.
+        // two-hop cross-range DFS from search_zorder.h, on quadtree paths.
         std::priority_queue<Result> TopDown_nodeentries_search(
             const std::vector<float> &query, const QuadRect &range, const FilterFlags &flags, size_t ef,
             size_t query_k, size_t edge_limit,
@@ -948,7 +948,7 @@ namespace iPreGraph
             return selected;
         }
 
-        // Adapt iRG_search_zorder.h::DFS: each transit point starts at the root,
+        // Adapt search_zorder.h::DFS: each transit point starts at the root,
         // descends along its own attribute path, and skips levels whose other
         // children all miss the query. Leaves are handled by direct selection.
         void DFS(Id pid, const QuadRect &range, const FilterFlags &flags, size_t limit,

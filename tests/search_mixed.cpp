@@ -3,7 +3,7 @@
 // list followed by one [low, high] pair per numerical attribute.
 // This source is not currently registered as a CMake executable target.
 
-#include "iRG_search_mixed.h"
+#include "search_mixed.h"
 
 #include <unordered_map>
 #include <sstream>
@@ -94,8 +94,8 @@ int main(int argc, char **argv)
 
     std::vector<std::vector<int>> gt;
     if (!paths["groundtruth_json"].empty())
-        // This legacy call currently fixes the expected shape to 1000 queries x 10 IDs.
-        gt = iPreGraph_mixed::MixedDataLoader::LoadGtJson(paths["groundtruth_json"], 1000, 10);
+        gt = iPreGraph_mixed::MixedDataLoader::LoadGtJson(
+            paths["groundtruth_json"], storage.query_nb, query_K);
 
     iPreGraph_mixed::iPreGraph_Search_Mixed<float> index(
         paths["data_vector"], paths["index"], &storage, M);

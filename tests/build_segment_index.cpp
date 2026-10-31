@@ -2,7 +2,7 @@
 // Inputs use a count/dimension header followed by row-major float32 vectors.
 // Attribute-dependent sorting must be completed before construction.
 
-#include "construction.h"
+#include "segment_graph_builder.h"
 
 std::unordered_map<std::string, std::string> paths;
 

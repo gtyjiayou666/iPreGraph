@@ -2,9 +2,9 @@
 
 #include <vector>
 #include <iterator>
-#include "utils_multi.h"
-#include "searcher.hpp"
-#include "memory.hpp"
+#include "multi_attribute_utils.h"
+#include "search_containers.h"
+#include "memory_utils.h"
 #include <bitset>
 #include <stack>
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <algorithm>
 
 // ============================================================================
-// iRG_search_mixed.h —— 支持"标签 + 数值"混合属性的向量近似近邻检索
+// search_mixed.h —— 支持"标签 + 数值"混合属性的向量近似近邻检索
 //
 // 数据组织（与已有 label / zorder 两套方案对齐）：
 //   数据点先按标签（label）升序排列；标签相同的点再按数值属性的 z-order 码升序排列，
@@ -39,7 +39,7 @@
 
 namespace iPreGraph_mixed
 {
-    // utils.h 中 tableint / linklistsizeint 定义于 iPreGraph 命名空间，这里引入以便裸用
+    // segment_tree_utils.h 中 tableint / linklistsizeint 定义于 iPreGraph 命名空间，这里引入以便裸用
     using iPreGraph::linklistsizeint;
     using iPreGraph::tableint;
 
@@ -1270,7 +1270,7 @@ namespace iPreGraph_mixed
         // ------------------------------------------------------------------------
 
         // 多区间候选点比较器：针对 iPreGraph_multi::PFIORPRO 的小顶堆
-        // （dis 小的优先；utils.h 的 iPreGraph::Compare 接受的是
+        // （dis 小的优先；segment_tree_utils.h 的 iPreGraph::Compare 接受的是
         //  iPreGraph::PFIORPRO，类型不同，故在本地定义）
         struct ComparePFIORPRO
         {
@@ -1991,6 +1991,14 @@ namespace iPreGraph_mixed
                             Q_L.push_back(ll);
                             Q_R.push_back(rr);
                         }
+                    }
+                    // A query with no matching label block or Morton interval
+                    // has no candidates; do not index the empty interval arrays.
+                    if (Q_L.empty())
+                    {
+                        gettimeofday(&t2, NULL);
+                        searchtime += GetTime(t1, t2);
+                        continue;
                     }
                     int id = 0, max_len = 0;
                     for (size_t k = 0; k < Q_L.size(); k++)

@@ -41,7 +41,7 @@ void CheckPath(std::string filename)
 
 float GetTime(timeval &begin, timeval &end)
 {
-    return end.tv_sec - begin.tv_sec + (end.tv_usec - begin.tv_usec) * 1.0 / CLOCKS_PER_SEC;
+    return end.tv_sec - begin.tv_sec + (end.tv_usec - begin.tv_usec) * 1.0 / 1000000.0;
 }
 
 namespace iPreGraph

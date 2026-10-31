@@ -11,39 +11,44 @@ for the migrated iRangeGraph multi-attribute method.
 
 ## Build
 
-Use Linux with a C++17 compiler, CMake 3.23.1 or newer, and OpenMP support.
-The current configuration uses GCC-specific flags, POSIX headers, and x86
-optimizations. Native Windows builds require platform and build changes.
+Use a C++17 compiler (GCC or Clang on Linux, or a MinGW-w64 target on Windows)
+and CMake 3.23.1 or newer. Python 3 is required for the tests, which are enabled
+by default. Threads are detected by CMake; OpenMP is not required. Native MSVC
+is not supported because the timing code uses `sys/time.h`.
 
 ```bash
-cmake -S . -B build
-cmake --build build --parallel 8
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
 ```
 
 Run these commands from the repository root. Executables are written to
 `build/tests/`. HNSW headers are bundled in `include/`; no external ANN library
-installation is required.
+installation is required. For Windows, use a MinGW-w64 toolchain and Ninja
+(for example, add `-G Ninja -DCMAKE_CXX_COMPILER=g++` to configuration).
 
-The current configuration sets Debug flags in `tests/CMakeLists.txt` and adds
-optimization flags globally. Review both CMake files before reporting benchmark
-results; selecting a build type alone does not remove these settings. Newer
-compilers may require updating legacy compiler flags.
+Single-configuration builds default to Release. An explicit Debug or
+RelWithDebInfo configuration is honored. Enable `-DIPREGRAPH_NATIVE_ARCH=ON`
+only when binaries are intended for the build machine's CPU. To build programs
+without Python or regression tests, use `-DBUILD_TESTING=OFF`.
+
+GitHub Actions builds and runs the test suite with both GCC and Clang on Linux.
+The tests create small datasets locally; no dataset downloads are needed.
 
 ## Programs
 
-| Program | Purpose |
-| --- | --- |
-| `buildindex-quadtree` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
-| `search_multi-quadtree` | Benchmark two numerical attributes combined with AND. |
-| `buildindex` | Build a legacy segment-tree graph index over the supplied vector order. |
-| `search_multi-zorder` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
-| `search_multi-zorder-label` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
-| `search_multi-or-json` | Search categorical label OR predicates supplied as JSON. |
+| Program | Source | Purpose |
+| --- | --- | --- |
+| `buildindex-quadtree` | `tests/build_quadtree_index.cpp` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
+| `search_multi-quadtree` | `tests/search_quadtree.cpp` | Benchmark two numerical attributes combined with AND. |
+| `buildindex` | `tests/build_segment_index.cpp` | Build a legacy segment-tree graph index over the supplied vector order. |
+| `search_multi-zorder` | `tests/search_zorder.cpp` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
+| `search_multi-zorder-label` | `tests/search_zorder_label.cpp` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
+| `search_multi-or-json` | `tests/search_label.cpp` | Search categorical label OR predicates supplied as JSON. |
 
-`tests/search_mixed.cpp` is a standalone mixed label/numerical driver using
-`(label, z_code)` order. It is not registered as a CMake target. Its optional
-ground-truth loader currently receives fixed arguments of 1,000 queries and 10
-neighbors; adapt these before using other ground-truth sizes.
+`search_mixed` uses `(label, z_code)` row order and is built from
+`tests/search_mixed.cpp`. Ground truth is optional; when supplied, its shape must
+match the loaded query count and `--query_K`.
 
 ## Quadtree input formats
 
@@ -250,20 +255,29 @@ This means `(label = 3 OR label = 7) AND (10 <= a0 <= 20) AND
 but requires `(label, z_code)` row order. Keep vectors, attributes, index rows,
 and ground-truth IDs aligned whenever data is reordered.
 
-## Regression test
+## Tests
 
 The self-contained test creates synthetic 2D and 4D data, including Morton codes
 wider than 64 bits. It checks exact full-range results on complete graphs,
 predicate validity, duplicate IDs, empty results, input validation, and CSV output.
-It does not require downloaded datasets or measure performance.
+It also checks aligned allocation and deallocation. The CLI smoke test builds
+actual segment-tree and quadtree indexes and queries all search variants against
+independent exact nearest-neighbor results, including an empty mixed predicate.
+These checks do not require downloaded datasets or measure performance.
 
 ```bash
 cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --target irange_multi_test
-ctest --test-dir build --output-on-failure -R irange_multi
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
 ```
 
 ## Code map
+
+Project-owned source files use lowercase `snake_case` names. Headers use `.h`,
+program sources use `.cpp`, and regression tests use the `_test.cpp` suffix.
+Names identify the operation or component: `search_*`, `build_*`, `*_builder`,
+and `*_utils`. Bundled HNSW headers retain their upstream names. Executable names
+are listed separately above so existing benchmark commands remain valid.
 
 | File | Responsibility |
 | --- | --- |
@@ -271,10 +285,10 @@ ctest --test-dir build --output-on-failure -R irange_multi
 | `include/quadtree_graph_builder.h` | Bottom-up graph construction and a reusable worker pool. |
 | `include/quadtree_cli.h` | Quadtree options and validated vector/JSON/CSV input. |
 | `include/quadtree_progress.h` | Construction progress reporting. |
-| `include/construction.h` | Legacy segment-tree graph construction. |
-| `include/utils.h`, `include/utils_multi.h` | Legacy loaders, attribute structures, and Morton encoding. |
-| `include/iRG_search*.h` | Legacy filtered search variants. |
-| `include/searcher.hpp`, `include/memory.hpp` | Search containers, aligned allocation, and prefetch helpers. |
+| `include/segment_graph_builder.h` | Legacy segment-tree graph construction. |
+| `include/segment_tree_utils.h`, `include/multi_attribute_utils.h` | Legacy loaders, attribute structures, and Morton encoding. |
+| `include/search_zorder.h`, `include/search_zorder_label.h`, `include/search_label.h`, `include/search_mixed.h`, `include/search_multi.h` | Legacy filtered search variants. |
+| `include/search_containers.h`, `include/memory_utils.h` | Search containers, aligned allocation, and prefetch helpers. |
 | `include/hnswlib.h`, `include/hnswalg.h`, `include/space_*.h` | Bundled HNSW interfaces and distance kernels. |
 
 ## License

@@ -1,6 +1,6 @@
 // Regression coverage for the migrated iRangeGraph multi-attribute search.
 // Run with a writable fixture directory; no external datasets are required.
-#include "iRG_search_zorder.h"
+#include "search_zorder.h"
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -198,6 +198,21 @@ void run_case(const std::filesystem::path &directory, int dimensions) {
 int main(int argc, char **argv) {
     try {
         if (argc != 2) throw std::runtime_error("usage: irange_multi_test <fixture-directory>");
+        // Allocator copies must free the requested block, including after a
+        // second allocation. This also exercises native Windows aligned frees.
+        memory::align_alloc<int> allocator;
+        int *small = allocator.allocate(32);
+        int *large = allocator.allocate(20000);
+        require(reinterpret_cast<uintptr_t>(small) % 64 == 0, "small block alignment");
+        require(reinterpret_cast<uintptr_t>(large) % (1u << 21) == 0, "large block alignment");
+        small[0] = 17; large[19999] = 23;
+        memory::align_alloc<int> copy = allocator;
+        copy.deallocate(small, 32);
+        require(large[19999] == 23, "deallocated the wrong block");
+        allocator.deallocate(large, 20000);
+        searcher::Bitset<uint32_t> bits(65);
+        bits.set(64);
+        require(bits.get(64) && !bits.get(63), "32-bit bitset block layout");
         const std::filesystem::path directory(argv[1]);
         run_case(directory / "2d", 2);
         run_case(directory / "4d", 4);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "utils.h"
+#include "segment_tree_utils.h"
 
 #include <algorithm>
 #include <cerrno>

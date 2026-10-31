@@ -2,7 +2,7 @@
 // Base vectors and attributes must be aligned and ordered by the label column.
 // See README.md for the binary vector layout and common index options.
 
-#include "iRG_search_label.h"
+#include "search_label.h"
 
 std::unordered_map<std::string, std::string> paths;
 
