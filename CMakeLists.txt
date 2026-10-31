@@ -3,6 +3,7 @@ project(RFANN)
 
 include(GNUInstallDirs)
 include(CheckCXXCompilerFlag)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -1,6 +1,13 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
+#include <queue>
+#include <random>
+#include <utility>
 // #include "utils.h"
 #include "utils_multi.h"
 #include "searcher.hpp"
@@ -12,6 +19,8 @@
 
 namespace iPreGraph_multi
 {
+    using iPreGraph::tableint;
+    using iPreGraph::linklistsizeint;
     // Query a legacy graph whose rows are sorted by the shared Morton encoder.
     // MBR checks filter candidates without changing their base-row IDs.
     template <typename dist_t>
@@ -345,6 +354,181 @@ namespace iPreGraph_multi
                 cur_node = nxt_node;
             }
         }
+        int MaxStep{20};
+        std::vector<double> probability;
+        void setprob()
+        {
+            if (MaxStep <= 0)
+                throw Exception("MaxStep must be positive");
+            probability.resize(MaxStep);
+
+            for (int x = 0; x < MaxStep; x++)
+            {
+                probability[x] = 1.0 / (1.0 + std::exp(x));
+            }
+        }
+        std::vector<std::pair<int, bool>> SelectEdgeMutil(int pid, int l, int r, int edge_limit, int current_step, searcher::Bitset<uint64_t> &visited_set, const std::vector<char> &filter_ids_map)
+        {
+            if (MaxStep <= 0 || probability.size() != static_cast<size_t>(MaxStep))
+                setprob();
+            if (current_step < -1)
+                throw Exception("current_step must be at least -1");
+            TreeNode *cur_node = nullptr, *nxt_node = tree->root;
+            std::vector<std::pair<int, bool>> selected_edges;
+            selected_edges.reserve(edge_limit);
+            do
+            {
+                cur_node = nxt_node;
+                bool contain = false;
+                do
+                {
+                    contain = false;
+                    if (cur_node->childs.size() == 0)
+                        nxt_node = nullptr;
+                    else
+                    {
+                        for (int i = 0; i < cur_node->childs.size(); ++i)
+                        {
+                            if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
+                            {
+                                nxt_node = cur_node->childs[i];
+                                break;
+                            }
+                        }
+                        if (GetOverLap(cur_node->lbound, cur_node->rbound, l, r) == GetOverLap(nxt_node->lbound, nxt_node->rbound, l, r))
+                        {
+                            cur_node = nxt_node;
+                            contain = true;
+                        }
+                    }
+                } while (contain);
+
+                int *data = (int *)get_linklist(pid, cur_node->depth);
+                size_t size = getListCount((linklistsizeint *)data);
+
+                for (size_t j = 1; j <= size; ++j)
+                {
+                    int neighborId = *(data + j);
+                    if (neighborId < l || neighborId > r)
+                        continue;
+                    if (visited_set.get(neighborId))
+                        continue;
+                    const bool qualifying = filter_ids_map[neighborId] != 0;
+                    if (!qualifying)
+                    {
+                        const int next_step = current_step + 1;
+                        if (next_step >= MaxStep)
+                            continue;
+                        const double sample = static_cast<double>(std::rand()) / RAND_MAX;
+                        if (sample >= probability[next_step])
+                            continue;
+                    }
+                    selected_edges.emplace_back(neighborId, qualifying);
+                    if (selected_edges.size() == edge_limit)
+                        return selected_edges;
+                }
+
+            } while (cur_node->lbound < l || cur_node->rbound > r);
+
+            return selected_edges;
+        }
+        // iRangeGraph multi-attribute search on the supplied position cover [l,r].
+        // flags encode the full predicate; returned IDs are current Z-order row IDs.
+        // Nonqualifying transit vertices are sampled with logistic probability.
+        // A qualifying point resets the transit-step counter to -1. The explicit
+        // seed controls entry selection; transit sampling uses the C rand() state.
+        std::priority_queue<PFI> TopDown_nodeentries_search_mutil(
+            std::vector<TreeNode *> &filterednodes, const void *query_data,
+            int l, int r, int ef, int query_k, int edge_limit,
+            const std::vector<char> &filter_ids_map,
+            unsigned seed = static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count()))
+        {
+            if (ef <= 0 || query_k <= 0 || edge_limit <= 0)
+                throw Exception("ef, query_k and edge limit must be positive");
+            if (filter_ids_map.size() != max_elements_)
+                throw Exception("predicate flags must match the index size");
+            if (MaxStep <= 0 || probability.size() != static_cast<size_t>(MaxStep))
+                setprob();
+            std::priority_queue<PFI> top_candidates;
+            if (l > r)
+                return top_candidates;
+            if (l < 0 || static_cast<size_t>(r) >= max_elements_)
+                throw Exception("query cover lies outside the index");
+            using Candidate = std::pair<float, std::pair<int, int>>;
+            std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidate_set;
+            searcher::Bitset<uint64_t> visited_set(max_elements_);
+            std::default_random_engine entry_random(seed);
+
+            // Initialize entries and the result threshold as in the filter search.
+            float lowerBound = std::numeric_limits<float>::max();
+            for (auto *node : filterednodes)
+            {
+                std::uniform_int_distribution<int> sample(node->lbound, node->rbound);
+                const int pid = sample(entry_random);
+                if (visited_set.get(pid))
+                    continue;
+                visited_set.set(pid);
+                const float dis = fstdistfunc_(query_data, getDataByInternalId(pid), dist_func_param_);
+                if (top_candidates.size() < static_cast<size_t>(ef) || dis < lowerBound)
+                {
+                    candidate_set.emplace(dis, std::make_pair(pid, -1));
+                    if (filter_ids_map[pid] != 0)
+                    {
+                        top_candidates.emplace(dis, pid);
+                        if (top_candidates.size() > static_cast<size_t>(ef))
+                            top_candidates.pop();
+                        lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+
+            while (!candidate_set.empty())
+            {
+                const auto current = candidate_set.top();
+                ++metric_hops;
+                if (current.first > lowerBound)
+                    break;
+                candidate_set.pop();
+                const int pid = current.second.first;
+                const int current_step = current.second.second;
+                auto selected = SelectEdgeMutil(pid, l, r, edge_limit, current_step, visited_set, filter_ids_map);
+                int num_edges = selected.size();
+                for (int i = 0; i < std::min(num_edges, 3); ++i)
+                {
+                    memory::mem_prefetch_L1(getDataByInternalId(selected[i].first), this->prefetch_lines);
+                }
+                // Preserve selection order, as in the filter search.
+                for (int i = 0; i < num_edges; ++i)
+                {
+                    const auto &neighbor = selected[i];
+                    const int neighbor_id = neighbor.first;
+                    const bool qualifying = neighbor.second;
+                    if (visited_set.get(neighbor_id))
+                        continue;
+                    visited_set.set(neighbor_id);
+                    const float dis = fstdistfunc_(query_data, getDataByInternalId(neighbor_id), dist_func_param_);
+                    ++metric_distance_computations;
+                    if (top_candidates.size() < static_cast<size_t>(ef) || dis < lowerBound)
+                    {
+                        int next_step = current_step + 1;
+                        if (qualifying)
+                        {
+                            top_candidates.emplace(dis, neighbor_id);
+                            next_step = -1;
+                        }
+                        candidate_set.emplace(dis, std::make_pair(neighbor_id, next_step));
+                        if (top_candidates.size() > static_cast<size_t>(ef))
+                            top_candidates.pop();
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+            while (top_candidates.size() > static_cast<size_t>(query_k))
+                top_candidates.pop();
+            return top_candidates;
+        }
+
         std::priority_queue<PFI> TopDown_nodeentries_search_zorder_and(std::vector<TreeNode *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit, MBR &wp, const std::vector<char> &filter_ids_map)
         {
 
@@ -683,6 +867,140 @@ namespace iPreGraph_multi
                 }
 
                 outfile.close();
+            }
+        }
+
+        // Benchmark iRangeGraph's probabilistic multi-attribute traversal.
+        // Predicate flags are cached per domain (N * query_count bytes) outside
+        // the timed EF sweep. Morton bounds, entry sampling, and traversal are timed.
+        // CSV columns: ef, recall, qps, distance computations/query, hops/query.
+        void search_irange(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
+        {
+            setprob();
+            const int N = storage->data_nb;
+            if (N <= 0 || storage->query_nb <= 0 || storage->query_K <= 0 || edge_limit <= 0)
+                throw Exception("data count, query count, query_K and edge limit must be positive");
+            if (storage->multi_zorder.size() != static_cast<size_t>(N))
+                throw Exception("search_irange requires the existing Z-order keys loaded by the caller");
+            for (int ef : SearchEF)
+                if (ef <= 0)
+                    throw Exception("ef must be positive");
+
+            if (!std::is_sorted(storage->multi_zorder.begin(), storage->multi_zorder.end(),
+                                MultiAttributeZOrderLess))
+                throw Exception("search_irange requires Morton-sorted base rows");
+            for (const auto &range : storage->query_range_multi)
+            {
+                const std::string &domain = range.first;
+                const auto gt_it = storage->ground_truth.find(domain);
+                if (gt_it == storage->ground_truth.end() ||
+                    gt_it->second.size() != static_cast<size_t>(storage->query_nb) ||
+                    range.second.size() != static_cast<size_t>(storage->query_nb))
+                    throw Exception("query ranges and ground truth must match the query count");
+                const auto &gt = gt_it->second;
+                const std::string savepath = saveprefix + domain + "-irange.csv";
+                CheckPath(savepath);
+                std::ofstream outfile(savepath);
+                if (!outfile.is_open())
+                    throw Exception("cannot open " + savepath);
+                std::cout << "Directory: " << savepath << std::endl;
+
+                // Cache every query's predicate flags once, outside all timed ef runs.
+                // This cache belongs to one domain and is released after its ef sweep.
+                std::vector<std::vector<char>> query_flags(storage->query_nb);
+                for (int i = 0; i < storage->query_nb; ++i)
+                {
+                    const auto &cons = range.second[i];
+                    const int num_attrs = static_cast<int>(cons.attr_constraints.size());
+                    if (num_attrs <= 0 || static_cast<size_t>(num_attrs) != attr_dim_)
+                        throw Exception("query attribute dimension mismatch");
+                    for (const auto &bounds : cons.attr_constraints)
+                        if (bounds.first > bounds.second)
+                            throw Exception("query lower bound exceeds upper bound");
+
+                    auto &flags = query_flags[i];
+                    flags.resize(N);
+                    for (int pid = 0; pid < N; ++pid)
+                    {
+                        bool qualifying = true;
+                        for (int d = 0; d < num_attrs; ++d)
+                        {
+                            const int value = storage->attributes[pid][d];
+                            if (value < cons.attr_constraints[d].first ||
+                                value > cons.attr_constraints[d].second)
+                            {
+                                qualifying = false;
+                                break;
+                            }
+                        }
+                        flags[pid] = static_cast<char>(qualifying);
+                    }
+                }
+                for (int ef : SearchEF)
+                {
+                    size_t tp = 0;
+                    double searchtime = 0;
+                    metric_hops = 0;
+                    metric_distance_computations = 0;
+                    for (int i = storage->query_nb - 1; i >= 0; --i)
+                    {
+                        const auto &cons = range.second[i];
+                        const int num_attrs = static_cast<int>(cons.attr_constraints.size());
+                        if (num_attrs <= 0 || static_cast<size_t>(num_attrs) != attr_dim_)
+                            throw Exception("query attribute dimension mismatch");
+
+                        const std::vector<char> &filter_ids_map = query_flags[i];
+
+                        timeval t1, t2;
+                        gettimeofday(&t1, NULL);
+                        std::vector<int> coords_min(num_attrs), coords_max(num_attrs);
+                        for (int d = 0; d < num_attrs; ++d)
+                        {
+                            coords_min[d] = cons.attr_constraints[d].first;
+                            coords_max[d] = cons.attr_constraints[d].second;
+                        }
+                        const auto z_min = CalculateMultiAttributeZOrder(coords_min);
+                        const auto z_max = CalculateMultiAttributeZOrder(coords_max);
+                        const auto first = std::lower_bound(storage->multi_zorder.begin(),
+                                                            storage->multi_zorder.end(), z_min, MultiAttributeZOrderLess);
+                        const auto end = std::upper_bound(storage->multi_zorder.begin(),
+                                                          storage->multi_zorder.end(), z_max, MultiAttributeZOrderLess);
+                        const int l = static_cast<int>(first - storage->multi_zorder.begin());
+                        const int r = static_cast<int>(end - storage->multi_zorder.begin()) - 1;
+                        std::priority_queue<PFI> res;
+                        if (l <= r)
+                        {
+                            auto nodes = tree->range_filter(tree->root, l, r);
+                            res = TopDown_nodeentries_search_mutil(
+                                nodes, storage->query_points[i].data(), l, r, ef,
+                                storage->query_K, edge_limit, filter_ids_map);
+                        }
+                        gettimeofday(&t2, NULL);
+                        searchtime += GetTime(t1, t2);
+
+                        std::map<int, int> record;
+                        while (!res.empty())
+                        {
+                            const int id = res.top().second;
+                            res.pop();
+                            if (record.count(id))
+                                throw Exception("repetitive search results");
+                            record[id] = 1;
+                            if (std::find(gt[i].begin(), gt[i].end(), id) != gt[i].end())
+                                ++tp;
+                        }
+                    }
+                    const double recall = double(tp) / storage->query_nb / storage->query_K;
+                    const double qps = storage->query_nb / searchtime;
+                    const double dco = double(metric_distance_computations) / storage->query_nb;
+                    const double hop = double(metric_hops) / storage->query_nb;
+                    outfile << ef << "," << recall << "," << qps << "," << dco << "," << hop << std::endl;
+                    if (!outfile)
+                        throw Exception("failed writing " + savepath);
+                    // Preserve the existing benchmark's recall stopping rule.
+                    if (recall < 0.9)
+                        break;
+                }
             }
         }
 

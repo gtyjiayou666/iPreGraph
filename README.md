@@ -6,7 +6,8 @@ attribute indexes for numerical range and categorical label predicates.
 
 The repository contains a two-attribute quadtree implementation and legacy
 segment-tree variants using Z-order and label filtering. Programs in `tests/`
-are command-line builders and benchmark drivers, rather than unit tests.
+include command-line builders, benchmark drivers, and a small regression test
+for the migrated iRangeGraph multi-attribute method.
 
 ## Build
 
@@ -35,7 +36,7 @@ compilers may require updating legacy compiler flags.
 | `buildindex-quadtree` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
 | `search_multi-quadtree` | Benchmark two numerical attributes combined with AND. |
 | `buildindex` | Build a legacy segment-tree graph index over the supplied vector order. |
-| `search_multi-zorder` | Search two numerical attributes using Morton/Z-order bounds. |
+| `search_multi-zorder` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
 | `search_multi-zorder-label` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
 | `search_multi-or-json` | Search categorical label OR predicates supplied as JSON. |
 
@@ -173,10 +174,12 @@ index over the exact vector order used by the search driver:
 The legacy index and `.qidx` formats are not interchangeable. Keep `--M`
 consistent between construction and search.
 
-For `search_multi-zorder`, sort vectors and their two numerical attributes by
+For `search_multi-zorder`, sort vectors and their numerical attributes by
 the Morton codes computed by `CalculateMultiAttributeZOrder` before building.
 Use non-negative integer attributes and regenerate ground-truth IDs for the
-sorted row order. Query ranges use the same four-value layout as the quadtree.
+sorted row order. The default is two attributes; set `--attr_num A` for other
+dimensions. Each query supplies `A` inclusive `[low, high]` pairs combined with
+AND, so flattened query rows contain `2 * A` integers.
 
 ```bash
 ./build/tests/search_multi-zorder \
@@ -187,6 +190,42 @@ sorted row order. Query ranges use the same four-value layout as the quadtree.
   --index_file indexes/segment.bin \
   --result_saveprefix results/zorder_ --M 16 --query_K 10
 ```
+
+### iRangeGraph multi-attribute search
+
+The same executable exposes the migrated iRangeGraph method with
+`--method irange`. Omitting `--method` retains the existing `zorder` method.
+For example, with four numerical attributes:
+
+```bash
+./build/tests/search_multi-zorder \
+  --data_path data/base_sorted.bin --query_path data/query.bin \
+  --attribute_file data/attributes_4d.json --attr_num 4 \
+  --range_saveprefix data/ranges_4d.json \
+  --groundtruth_saveprefix data/groundtruth.json \
+  --index_file indexes/segment.bin \
+  --result_saveprefix results/irange_ --M 16 --query_K 10 \
+  --method irange
+```
+
+This method uses the existing Morton row ordering and segment-tree graph.
+All numerical intervals must hold for a point to enter the result heap.
+Nonmatching points inside the Morton cover may be explored as transit vertices,
+with acceptance probability `1 / (1 + exp(step))`; a matching point resets
+that step counter. `MaxStep` defaults to 20. This is an approximate search and
+preserves the source implementation's early stopping rule.
+
+The header exposes `search_irange`, `TopDown_nodeentries_search_mutil`,
+`SelectEdgeMutil`, and `setprob` on `iPreGraph_Search_Zorder`. The original
+`mutil` spelling is kept for method compatibility. The low-level search initializes
+its probability table when needed. Its optional seed controls entry selection;
+transit sampling uses the C `rand()` state. Set both when comparing seeded runs.
+
+Output is `<prefix>mixed-irange.csv` with no header and columns
+`ef,recall,qps,dco,hops`. The EF sweep stops below recall 0.9, as in the source
+method. Predicate flags are cached outside the timed loop and require about
+`base_count * query_count` bytes per query domain. Timing includes Morton bounds,
+entry selection, and graph traversal; it excludes flag preparation and evaluation.
 
 Legacy EF lists are defined in the driver source files. CSV suffixes and metric
 columns vary by search method; consult the corresponding search header when
@@ -210,6 +249,19 @@ This means `(label = 3 OR label = 7) AND (10 <= a0 <= 20) AND
 (100 <= a1 <= 200)`. The standalone mixed driver uses the same predicate shape
 but requires `(label, z_code)` row order. Keep vectors, attributes, index rows,
 and ground-truth IDs aligned whenever data is reordered.
+
+## Regression test
+
+The self-contained test creates synthetic 2D and 4D data, including Morton codes
+wider than 64 bits. It checks exact full-range results on complete graphs,
+predicate validity, duplicate IDs, empty results, input validation, and CSV output.
+It does not require downloaded datasets or measure performance.
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --target irange_multi_test
+ctest --test-dir build --output-on-failure -R irange_multi
+```
 
 ## Code map
 
