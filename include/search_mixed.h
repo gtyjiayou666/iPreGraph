@@ -635,7 +635,7 @@ namespace iPreGraph_mixed
 
         // ------------------------------------------------------------------
         // 真值文件加载：[[pid,...],[pid,...],...]（每条查询一个 pid 列表，
-        // pid 为混合排序后的底库下标，与 search_multi-or-json 的 gt 口径一致）。
+        // pid 为混合排序后的底库下标，与 search_label 的 gt 口径一致）。
         // ------------------------------------------------------------------
         static std::vector<std::vector<int>> LoadGtJson(const std::string &filename, int query_nb, int query_K)
         {

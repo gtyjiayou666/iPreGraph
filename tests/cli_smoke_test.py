@@ -114,38 +114,38 @@ class Smoke:
                    for requested, rectangle in zip(label_sets, bounds)])
         write_json(work / "mixed_gt.json", ground_truth(base, queries, mixed_ids))
 
-        self.run("buildindex", ["--data_path", work / "base.bin", "--index_file", work / "segment.bin",
+        self.run("build_segment_index", ["--data_path", work / "base.bin", "--index_file", work / "segment.bin",
                                 "--M", 16, "--ef_construction", 32, "--threads", 2])
         require((work / "segment.bin").stat().st_size > 0, "segment index is empty")
         common = ["--data_path", work / "base.bin", "--query_path", work / "queries.bin",
                   "--index_file", work / "segment.bin", "--M", 16, "--query_K", 1]
         for method in ("zorder", "irange"):
             prefix = work / (method + "_")
-            self.run("search_multi-zorder", [*common, "--attribute_file", work / "attributes.json",
+            self.run("search_zorder", [*common, "--attribute_file", work / "attributes.json",
                      "--range_saveprefix", work / "ranges.json", "--groundtruth_saveprefix", work / "numeric_gt.json",
                      "--result_saveprefix", prefix, "--attr_num", 2, "--method", method], method)
             suffix = "mixed-zorder_ways.csv" if method == "zorder" else "mixed-irange.csv"
             self.check_csv(Path(str(prefix) + suffix), 5, method, 32)
 
-        self.run("buildindex-quadtree", ["--data_path", work / "base.bin", "--attribute_file", work / "attributes.json",
+        self.run("build_quadtree_index", ["--data_path", work / "base.bin", "--attribute_file", work / "attributes.json",
                  "--index_file", work / "tree.qidx", "--M", 16, "--ef_construction", 32,
                  "--leaf_size", 2, "--max_depth", 8, "--threads", 2, "--progress", 0])
         require((work / "tree.qidx").stat().st_size > 0, "quadtree index is empty")
         prefix = work / "quadtree_"
-        self.run("search_multi-quadtree", ["--index_file", work / "tree.qidx", "--query_path", work / "queries.bin",
+        self.run("search_quadtree", ["--index_file", work / "tree.qidx", "--query_path", work / "queries.bin",
                  "--range_saveprefix", work / "ranges.json", "--groundtruth_saveprefix", work / "numeric_gt.json",
                  "--result_saveprefix", prefix, "--query_K", 1, "--ef", "16,8", "--recall_stop", 0,
                  "--entry_points", 5, "--edge_limit", 16, "--seed", 42])
         self.check_csv(Path(str(prefix) + "mixed-quadtree.csv"), 3, "quadtree", 2)
 
         prefix = work / "label"
-        self.run("search_multi-or-json", [*common, "--attr_json", work / "label_attributes.json",
+        self.run("search_label", [*common, "--attr_json", work / "label_attributes.json",
                  "--label_json", work / "labels.json", "--groundtruth_json", work / "label_gt.json",
                  "--result_saveprefix", prefix, "--attr_num", 3, "--label_col", 0])
         self.check_csv(Path(str(prefix) + "_label_or.csv"), 5, "label OR", 19)
 
         prefix = work / "zorder_label"
-        self.run("search_multi-zorder-label", [*common, "--attribute_file", work / "label_attributes.json",
+        self.run("search_zorder_label", [*common, "--attribute_file", work / "label_attributes.json",
                  "--range_saveprefix", work / "mixed_queries.json", "--groundtruth_saveprefix", work / "mixed_gt.json",
                  "--result_saveprefix", prefix])
         self.check_csv(Path(str(prefix) + "_zorder_label_memory.csv"), 5, "Z-order + label", 1)

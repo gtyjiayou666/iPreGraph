@@ -39,12 +39,13 @@ The tests create small datasets locally; no dataset downloads are needed.
 
 | Program | Source | Purpose |
 | --- | --- | --- |
-| `buildindex-quadtree` | `tests/build_quadtree_index.cpp` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
-| `search_multi-quadtree` | `tests/search_quadtree.cpp` | Benchmark two numerical attributes combined with AND. |
-| `buildindex` | `tests/build_segment_index.cpp` | Build a legacy segment-tree graph index over the supplied vector order. |
-| `search_multi-zorder` | `tests/search_zorder.cpp` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
-| `search_multi-zorder-label` | `tests/search_zorder_label.cpp` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
-| `search_multi-or-json` | `tests/search_label.cpp` | Search categorical label OR predicates supplied as JSON. |
+| `build_quadtree_index` | `tests/build_quadtree_index.cpp` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
+| `search_quadtree` | `tests/search_quadtree.cpp` | Benchmark two numerical attributes combined with AND. |
+| `build_segment_index` | `tests/build_segment_index.cpp` | Build a legacy segment-tree graph index over the supplied vector order. |
+| `search_zorder` | `tests/search_zorder.cpp` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
+| `search_zorder_label` | `tests/search_zorder_label.cpp` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
+| `search_label` | `tests/search_label.cpp` | Search categorical label OR predicates supplied as JSON. |
+| `search_mixed` | `tests/search_mixed.cpp` | Search label OR and numerical range AND predicates using `(label, z_code)` order. |
 
 `search_mixed` uses `(label, z_code)` row order and is built from
 `tests/search_mixed.cpp`. Ground truth is optional; when supplied, its shape must
@@ -105,7 +106,7 @@ Create the index output directory, then run:
 
 ```bash
 mkdir -p indexes
-./build/tests/buildindex-quadtree \
+./build/tests/build_quadtree_index \
   --data_path data/base.fvecs \
   --attribute_file data/attributes.json \
   --index_file indexes/tree.qidx \
@@ -133,7 +134,7 @@ queries do not need the original base files.
 ### Run a query benchmark
 
 ```bash
-./build/tests/search_multi-quadtree \
+./build/tests/search_quadtree \
   --index_file indexes/tree.qidx \
   --query_path data/query.fvecs \
   --range_saveprefix data/ranges.json \
@@ -170,7 +171,7 @@ Legacy programs read vectors in the `bin` layout described above. Build the
 index over the exact vector order used by the search driver:
 
 ```bash
-./build/tests/buildindex \
+./build/tests/build_segment_index \
   --data_path data/base_sorted.bin \
   --index_file indexes/segment.bin \
   --M 16 --ef_construction 250 --threads 8
@@ -179,7 +180,7 @@ index over the exact vector order used by the search driver:
 The legacy index and `.qidx` formats are not interchangeable. Keep `--M`
 consistent between construction and search.
 
-For `search_multi-zorder`, sort vectors and their numerical attributes by
+For `search_zorder`, sort vectors and their numerical attributes by
 the Morton codes computed by `CalculateMultiAttributeZOrder` before building.
 Use non-negative integer attributes and regenerate ground-truth IDs for the
 sorted row order. The default is two attributes; set `--attr_num A` for other
@@ -187,7 +188,7 @@ dimensions. Each query supplies `A` inclusive `[low, high]` pairs combined with
 AND, so flattened query rows contain `2 * A` integers.
 
 ```bash
-./build/tests/search_multi-zorder \
+./build/tests/search_zorder \
   --data_path data/base_sorted.bin --query_path data/query.bin \
   --attribute_file data/attributes_sorted.json \
   --range_saveprefix data/ranges.json \
@@ -203,7 +204,7 @@ The same executable exposes the migrated iRangeGraph method with
 For example, with four numerical attributes:
 
 ```bash
-./build/tests/search_multi-zorder \
+./build/tests/search_zorder \
   --data_path data/base_sorted.bin --query_path data/query.bin \
   --attribute_file data/attributes_4d.json --attr_num 4 \
   --range_saveprefix data/ranges_4d.json \
@@ -236,13 +237,13 @@ Legacy EF lists are defined in the driver source files. CSV suffixes and metric
 columns vary by search method; consult the corresponding search header when
 processing results.
 
-For label OR search, `search_multi-or-json` takes `--attr_json`, `--label_json`,
+For label OR search, `search_label` takes `--attr_json`, `--label_json`,
 and `--groundtruth_json`, along with vector, index, result, `--M`, and `--query_K`
 arguments. Attributes must be ordered by the selected label column because
 matching label blocks are located by binary search. `--attr_num` defaults to
 `3`; `--label_col` defaults to `0`. Query labels are a JSON array of label lists.
 
-`search_multi-zorder-label` expects three attribute columns: a label in column
+`search_zorder_label` expects three attribute columns: a label in column
 zero and two numerical attributes. Sort rows by `(z_code, label)`. Each query
 contains a label list followed by one closed range per numerical attribute:
 
@@ -277,7 +278,7 @@ Project-owned source files use lowercase `snake_case` names. Headers use `.h`,
 program sources use `.cpp`, and regression tests use the `_test.cpp` suffix.
 Names identify the operation or component: `search_*`, `build_*`, `*_builder`,
 and `*_utils`. Bundled HNSW headers retain their upstream names. Executable names
-are listed separately above so existing benchmark commands remain valid.
+match their source filenames without the `.cpp` suffix (plus `.exe` on Windows).
 
 | File | Responsibility |
 | --- | --- |

@@ -10,7 +10,7 @@ int main(int argc, char **argv)
                             "--ef_construction", "--leaf_size", "--max_depth", "--threads", "--progress"});
         if (a.count("--help"))
         {
-            std::cout << "buildindex-quadtree --data_path base.fvecs --attribute_file attributes.json --index_file tree.qidx\n"
+            std::cout << "build_quadtree_index --data_path base.fvecs --attribute_file attributes.json --index_file tree.qidx\n"
                          "  attributes.json: [x0,y0,x1,y1,...], same row order as base.fvecs.\n"
                          "  Balanced by point count; leaf RNG graphs are merged bottom-up in parallel.\n"
                          "  Each root/internal/leaf node and its graph are saved in the index.\n"

@@ -20,7 +20,7 @@ int main(int argc, char **argv)
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h")
         {
-            std::cout << "search_multi-zorder --data_path base.bin --query_path query.bin\n"
+            std::cout << "search_zorder --data_path base.bin --query_path query.bin\n"
                          "  --attribute_file attributes.json --range_saveprefix ranges.json\n"
                          "  --groundtruth_saveprefix gt.json --index_file index.bin\n"
                          "  --result_saveprefix results/run_ --M 16 [--query_K 10]\n"
