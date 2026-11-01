@@ -566,6 +566,7 @@ namespace iPreGraph_multi
                     candidate_set.emplace(dis, pid);
                     if (filter_ids_map[pid] != 0)
                     {
+                        top_candidates.emplace(dis, pid);
                         top_candidates.pop();
                         lowerBound = top_candidates.top().first;
                     }
