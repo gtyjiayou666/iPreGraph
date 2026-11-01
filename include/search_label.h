@@ -12,10 +12,10 @@
 namespace iPreGraph
 {
 
-    // 解析 [[...],[...],[...]] 形式，保留外层分组，内层是整数列表
-    inline std::vector<std::vector<int>> fan_parse_json_array_of_array(const std::string &filename)
+    // Parse nested integer arrays while preserving the outer groups.
+    inline std::vector<std::vector<int>> read_nested_integer_arrays_json(const std::string &filename)
     {
-        const std::string s = fan_read_whole_file(filename);
+        const std::string s = read_text_file(filename);
         const std::string who = filename;
         std::vector<std::vector<int>> out;
         size_t i = 0;
@@ -48,7 +48,7 @@ namespace iPreGraph
             throw Exception("JSON parse error in " + who + ": outer structure must be an array");
         ++i;
         skip_ws();
-        if (i < s.size() && s[i] == ']') // 顶层为空 []
+        if (i < s.size() && s[i] == ']') // Empty outer array.
         {
             ++i;
             return out;
@@ -63,7 +63,7 @@ namespace iPreGraph
             skip_ws();
             if (i < s.size() && s[i] == ']')
             {
-                ++i; // 允许空标签列表 []
+                ++i; // Allow an empty label list.
             }
             else
             {
@@ -105,12 +105,12 @@ namespace iPreGraph
         return out;
     }
 
-    // 解析真值 JSON，自动识别两种格式：
-    //   嵌套 [[id,id,...],[id,...],...] ：外层每个数组 = 一个查询的真值列表
-    //   扁平 [a,b,c, d,e,f, ...]       ：query_nb * query_K 个整数按查询顺序拼接
-    inline std::vector<std::vector<int>> fan_parse_gt_json(const std::string &filename, int query_nb, int query_K)
+    // Parse ground-truth JSON in either supported layout:
+    // nested arrays contain one ID list per query;
+    // a flat array contains query_nb * query_K IDs in query order.
+    inline std::vector<std::vector<int>> load_ground_truth_json(const std::string &filename, int query_nb, int query_K)
     {
-        const std::string s = fan_read_whole_file(filename);
+        const std::string s = read_text_file(filename);
         size_t i = 0;
         while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])))
             ++i;
@@ -126,7 +126,7 @@ namespace iPreGraph
 
         if (nested)
         {
-            std::vector<std::vector<int>> gt = fan_parse_json_array_of_array(filename);
+            std::vector<std::vector<int>> gt = read_nested_integer_arrays_json(filename);
             if ((int)gt.size() != query_nb)
                 throw Exception("ground truth file " + filename + ": " + std::to_string(gt.size()) +
                                 " groups, but query_nb = " + std::to_string(query_nb));
@@ -136,7 +136,7 @@ namespace iPreGraph
 
         if (query_nb <= 0 || query_K <= 0)
             throw Exception("ground truth file " + filename + ": flat format needs valid query_nb and query_K");
-        std::vector<int> v = fan_parse_all_ints(s, filename);
+        std::vector<int> v = parse_integer_values(s, filename);
         if ((long long)v.size() != (long long)query_nb * query_K)
             throw Exception("ground truth file " + filename + ": " + std::to_string(v.size()) +
                             " integers, expected query_nb * query_K = " +
@@ -195,7 +195,6 @@ namespace iPreGraph
             vectorfile.read((char *)&dim_, sizeof(int));
 
             tree = new SegmentTreeLabel(max_elements_, storage->label_arr, 1);
-            // tree->BuildTree(tree->root);
 
             space = new hnswlib::L2Space(dim_);
             fstdistfunc_ = space->get_dist_func();
@@ -217,9 +216,9 @@ namespace iPreGraph
             {
                 for (int layer = 0; layer <= tree->max_depth; layer++)
                 {
-                    linklistsizeint *data = get_linklist(pid, layer);
+                    linklistsizeint *data = get_adjacency_list(pid, layer);
                     edgefile.read((char *)data, sizeof(tableint));
-                    int size = getListCount(data);
+                    int size = get_neighbor_count(data);
                     if (size > M_out)
                         throw Exception("real linklist size is bigger than defined M_out");
                     for (int i = 0; i < size; i++)
@@ -227,11 +226,9 @@ namespace iPreGraph
                         char *current_neighbor_ = (char *)(data + 1 + i);
                         edgefile.read(current_neighbor_, sizeof(tableint));
                     }
-                    // std::sort(data + 1, data + 1 + size);
                 }
 
-                char *data = getDataByInternalId(pid);
-                // vectorfile.read(data, data_size_);
+                char *data = get_vector_data(pid);
                 vectorfile.read(data, dim_ * sizeof(float));
             }
 
@@ -246,29 +243,29 @@ namespace iPreGraph
             data_memory_ = nullptr;
         }
 
-        inline char *getDataByInternalId(tableint internal_id) const
+        inline char *get_vector_data(tableint internal_id) const
         {
             return (data_memory_ + internal_id * size_data_per_element_ + offsetData_);
         }
 
-        linklistsizeint *get_linklist(tableint internal_id, int layer) const
+        linklistsizeint *get_adjacency_list(tableint internal_id, int layer) const
         {
             return (linklistsizeint *)(data_memory_ + internal_id * size_data_per_element_ + layer * size_links_per_layer_);
         }
 
-        int getListCount(linklistsizeint *ptr) const
+        int get_neighbor_count(linklistsizeint *ptr) const
         {
             return *((int *)ptr);
         }
 
-        int GetOverLap(int l, int r, int ql, int qr)
+        int interval_overlap_span(int l, int r, int ql, int qr)
         {
             int L = std::max(l, ql);
             int R = std::min(r, qr);
             return R - L + 1;
         }
 
-        std::vector<tableint> SelectEdge(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
+        std::vector<tableint> select_intra_range_edges(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
         {
             TreeNodeLabel *cur_node = nullptr, *nxt_node = tree->root;
             std::vector<tableint> selected_edges;
@@ -292,7 +289,7 @@ namespace iPreGraph
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -300,16 +297,14 @@ namespace iPreGraph
                     }
                 } while (contain);
 
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
 
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
                     if (neighborId < ql || neighborId > qr)
                         continue;
-                    // if (visitedpool[neighborId] == visited_tag)
-                    //     continue;
                     if (visited_set.get(neighborId))
                         continue;
                     selected_edges.emplace_back(neighborId);
@@ -326,14 +321,14 @@ namespace iPreGraph
 
         struct GapInfo
         {
-            int index; // 间隙在原始区间之间的索引 (位于 Q_R[i] 和 Q_L[i+1] 之间)
+            int index; // Gap index i, between Q_R[i] and Q_L[i + 1].
             int len;
         };
         struct CompareGap
         {
             bool operator()(const GapInfo &a, const GapInfo &b)
             {
-                return a.len < b.len; // 最大堆：大的元素优先级高
+                return a.len < b.len; // Max-heap: the longest gap comes first.
             }
         };
         void merge_small_gaps(const std::vector<int> &Q_L, const std::vector<int> &Q_R,
@@ -343,12 +338,10 @@ namespace iPreGraph
             int n = Q_L.size();
             mapping.assign(n, 0);
 
-            // std::vector<GapInfo> gaps;
             double total_data = Q_R[n - 1] - Q_L[0] + 1;
             double total_gaps = 0;
 
             std::priority_queue<GapInfo, std::vector<GapInfo>, CompareGap> max_heap_gaps;
-            // max_heap_gaps.reserve(n > 0 ? n - 1 : 0);
 
             for (int i = 0; i < n - 1; ++i)
             {
@@ -366,7 +359,6 @@ namespace iPreGraph
             {
                 Q_L1.push_back(Q_L[0]);
                 Q_R1.push_back(Q_R[n - 1]);
-                // std::cout << current_gaps << "," << max_heap_gaps.size() << std::endl;
                 return;
             }
             int current_gaps = 0;
@@ -374,11 +366,9 @@ namespace iPreGraph
             {
                 GapInfo gap = max_heap_gaps.top();
                 current_gaps = current_gaps + gap.len;
-                // std::cout << current_gaps << ",";
                 if (current_gaps >= s)
                 {
                     is_keeper[gap.index] = true;
-                    // std::cout << current_gaps << "," << max_heap_gaps.size() << std::endl;
                     break;
                 }
                 max_heap_gaps.pop();
@@ -406,23 +396,21 @@ namespace iPreGraph
                     mapping[i + 1] = new_idx;
                 }
             }
-            // 推送最后一个区间
+            // Emit the final range.
             Q_L1.push_back(current_l);
             Q_R1.push_back(current_r);
         }
 
-        std::priority_queue<PFI> TopDown_nodeentries_search_or_Pro(std::vector<TreeNodeLabel *> &filterednodes, const void *query_data, int ef, int query_k, std::vector<int> &Q_L, std::vector<int> &Q_R, int edge_limit, int id)
+        std::priority_queue<PFI> search_merged_ranges(std::vector<TreeNodeLabel *> &filterednodes, const void *query_data, int ef, int query_k, std::vector<int> &Q_L, std::vector<int> &Q_R, int edge_limit, int id)
         {
             std::vector<int> Q_L1, Q_R1, mapping;
             merge_small_gaps(Q_L, Q_R, Q_L1, Q_R1, mapping, 3);
             int range_num = Q_L1.size();
-            // std::cout << "range_num = " << range_num << std::endl;
 
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
 
             std::priority_queue<PFIORPRO, std::vector<PFIORPRO>, Compare> candidate_set;
-            // std::priority_queue<PFI, std::vector<PFI>, std::greater<PFI>> candidate_set;
             std::priority_queue<PFI> top_candidates;
             searcher::Bitset<uint64_t> visited_set(max_elements_);
 
@@ -436,7 +424,7 @@ namespace iPreGraph
                     continue;
                 }
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -452,7 +440,6 @@ namespace iPreGraph
                     lowerBound = top_candidates.top().first;
                 }
             }
-            // bool erfen = range_num < 16;
             while (!candidate_set.empty())
             {
                 auto current_point_pair = candidate_set.top();
@@ -464,26 +451,6 @@ namespace iPreGraph
                 int range_id = current_point_pair.range_id;
                 if (range_id == -1)
                 {
-                    // if (erfen)
-                    // {
-                    //     for (int i = 0; i < range_num; i++)
-                    //     {
-                    //         if (current_pid >= Q_L1[i])
-                    //         {
-                    //             if (current_pid <= Q_R1[i])
-                    //             {
-                    //                 range_id = i;
-                    //                 break;
-                    //             }
-                    //         }
-                    //         else
-                    //         {
-                    //             break;
-                    //         }
-                    //     }
-                    // }
-                    // else
-                    // {
                     auto it = std::lower_bound(Q_L1.begin(), Q_L1.end(), current_pid);
                     if (it != Q_L1.end())
                     {
@@ -501,13 +468,12 @@ namespace iPreGraph
                     {
                         range_id = range_num - 1;
                     }
-                    // }
                 }
-                auto selected_edges = SelectEdge(current_pid, Q_L1[range_id], Q_R1[range_id], edge_limit, visited_set);
+                auto selected_edges = select_intra_range_edges(current_pid, Q_L1[range_id], Q_R1[range_id], edge_limit, visited_set);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -515,7 +481,7 @@ namespace iPreGraph
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -546,11 +512,11 @@ namespace iPreGraph
                 }
                 std::vector<tableint> edges;
                 edges.reserve(edge_limit / 2);
-                DFS_new1(Q_L, Q_R, current_pid, edge_limit / 2, 2, edges);
+                select_cross_range_edges_from_ranges(Q_L, Q_R, current_pid, edge_limit / 2, 2, edges);
                 int num_edges1 = edges.size();
                 for (int i = 0; i < std::min(num_edges1, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges1; ++i)
                 {
@@ -558,29 +524,21 @@ namespace iPreGraph
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < ef)
                     {
-                        // candidate_set.emplace(dis, neighbor_id, mapping[edges[i].second]);
                         candidate_set.emplace(dis, neighbor_id, -1);
-                        // if (flags[neighbor_id])
-                        // {
                         top_candidates.emplace(dis, neighbor_id);
                         lowerBound = top_candidates.top().first;
-                        // }
                     }
                     else if (dis < lowerBound)
                     {
-                        // candidate_set.emplace(dis, neighbor_id, mapping[edges[i].second]);
                         candidate_set.emplace(dis, neighbor_id, -1);
-                        // if (flags[neighbor_id])
-                        // {
                         top_candidates.emplace(dis, neighbor_id);
                         top_candidates.pop();
                         lowerBound = top_candidates.top().first;
-                        // }
                     }
                 }
             }
@@ -589,7 +547,7 @@ namespace iPreGraph
             return top_candidates;
         }
 
-        void DFS_new1(std::vector<int> &QL, std::vector<int> &QR, int pid, int edge_limit, int deep, std::vector<tableint> &edges)
+        void select_cross_range_edges_from_ranges(std::vector<int> &QL, std::vector<int> &QR, int pid, int edge_limit, int deep, std::vector<tableint> &edges)
         {
             int Qsize = QL.size();
             if (deep == 0 || Qsize <= 1)
@@ -621,28 +579,27 @@ namespace iPreGraph
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, left, right) == GetOverLap(nxt_node->lbound, nxt_node->rbound, left, right))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, left, right) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, left, right))
                         {
                             cur_node = nxt_node;
                             contain = true;
                         }
                     }
                 } while (contain);
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
                 for (int j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
                     if (neighborId < left || neighborId > right)
                         continue;
-                    // count--;
                     if (flags[neighborId])
                     {
                         edges.emplace_back(neighborId);
                     }
                     else
                     {
-                        DFS_new1(QL, QR, neighborId, edge_limit, deep - 1, edges);
+                        select_cross_range_edges_from_ranges(QL, QR, neighborId, edge_limit, deep - 1, edges);
                     }
                     if (edges.size() >= edge_limit)
                     {
@@ -701,15 +658,15 @@ namespace iPreGraph
         }
 
 
-        // 带缓存的 NodePossible：每个查询分配一个 bitmap 保存是否已计算相交
-        inline bool NodePossibleCached(TreeNodeLabel *node, const Bitmap &label_bitmap, std::vector<uint8_t> &node_intersect_cache)
+        // Cache whether a node's label summary intersects this query's labels.
+        inline bool may_match_labels_cached(TreeNodeLabel *node, const Bitmap &label_bitmap, std::vector<uint8_t> &node_intersect_cache)
         {
             int nid = node->node_id;
             uint8_t c = node_intersect_cache[nid];
             if (c != 0)
-                return c == 1; // 1=相交, 2=不相交
+                return c == 1; // 1: intersecting; 2: disjoint.
 
-            // 首次计算
+            // Compute the intersection on the first visit.
             bool res = false;
             for (size_t d = 0; d < node->bmps.size(); d++)
             {
@@ -723,8 +680,8 @@ namespace iPreGraph
             return res;
         }
 
-        // SelectEdgeLabel: 参数改为 Bitmap
-        std::vector<tableint> SelectEdgeLabel(int pid, int ql, int qr, int edge_limit,
+        // Select direct qualifying neighbors using cached segment summaries.
+        std::vector<tableint> select_direct_edges(int pid, int ql, int qr, int edge_limit,
                                               std::vector<bool> &visited_set,
                                               const Bitmap &label_bitmap, std::vector<uint8_t> &node_intersect_cache)
         {
@@ -750,14 +707,14 @@ namespace iPreGraph
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
                         }
                     }
                 } while (contain);
-                if (!NodePossibleCached(cur_node, label_bitmap, node_intersect_cache))
+                if (!may_match_labels_cached(cur_node, label_bitmap, node_intersect_cache))
                     return selected_edges;
                 do
                 {
@@ -774,7 +731,7 @@ namespace iPreGraph
                             }
                             else
                             {
-                                if (!NodePossibleCached(cur_node->childs[i], label_bitmap, node_intersect_cache))
+                                if (!may_match_labels_cached(cur_node->childs[i], label_bitmap, node_intersect_cache))
                                     contain = true;
                             }
                         }
@@ -782,8 +739,8 @@ namespace iPreGraph
                             cur_node = nxt_node;
                     }
                 } while (contain);
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
@@ -799,8 +756,8 @@ namespace iPreGraph
             return selected_edges;
         }
 
-        // DFSLabel: 参数改为 Bitmap
-        void DFSLabel(int pid, int ql, int qr, int edge_limit, int deep,
+        // Find qualifying endpoints through bounded-depth graph expansion.
+        void select_cross_range_edges(int pid, int ql, int qr, int edge_limit, int deep,
                       std::vector<tableint> &edges, const Bitmap &label_bitmap, std::vector<uint8_t> &node_intersect_cache)
         {
             TreeNodeLabel *cur_node = tree->root;
@@ -821,7 +778,7 @@ namespace iPreGraph
                             break;
                         }
                     }
-                    if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                    if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                     {
                         cur_node = nxt_node;
                         contain = true;
@@ -831,7 +788,7 @@ namespace iPreGraph
 
             while (cur_node)
             {
-                if (!NodePossibleCached(cur_node, label_bitmap, node_intersect_cache))
+                if (!may_match_labels_cached(cur_node, label_bitmap, node_intersect_cache))
                     break;
                 bool inters = false;
                 if (cur_node->childs.size() == 0)
@@ -846,7 +803,7 @@ namespace iPreGraph
                         }
                         else
                         {
-                            if (NodePossibleCached(cur_node->childs[i], label_bitmap, node_intersect_cache))
+                            if (may_match_labels_cached(cur_node->childs[i], label_bitmap, node_intersect_cache))
                                 inters = true;
                         }
                     }
@@ -854,8 +811,8 @@ namespace iPreGraph
 
                 if (inters)
                 {
-                    int *data = (int *)get_linklist(pid, cur_node->depth);
-                    size_t size = getListCount((linklistsizeint *)data);
+                    int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                    size_t size = get_neighbor_count((linklistsizeint *)data);
                     for (int j = 1; j <= size; ++j)
                     {
                         int neighborId = *(data + j);
@@ -865,7 +822,7 @@ namespace iPreGraph
                         }
                         else if (deep > 1)
                         {
-                            DFSLabel(neighborId, ql, qr, edge_limit, deep - 1, edges, label_bitmap, node_intersect_cache);
+                            select_cross_range_edges(neighborId, ql, qr, edge_limit, deep - 1, edges, label_bitmap, node_intersect_cache);
                         }
                         if (edges.size() >= edge_limit)
                         {
@@ -877,8 +834,8 @@ namespace iPreGraph
             }
         }
 
-        // TopDown_nodeentries_search_Label: 参数改为 Bitmap
-        std::priority_queue<PFI> TopDown_nodeentries_search_Label(std::vector<TreeNodeLabel *> &filterednodes,
+        // Best-first label search using cached segment summaries.
+        std::priority_queue<PFI> search_pdg(std::vector<TreeNodeLabel *> &filterednodes,
                                                                   const void *query_data,
                                                                   int l, int r, int ef, int query_k, int edge_limit,
                                                                   const Bitmap &label_bitmap, std::vector<uint8_t> &node_intersect_cache)
@@ -898,7 +855,7 @@ namespace iPreGraph
                     continue;
                 }
                 visited_set[pid] = true;
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -928,11 +885,11 @@ namespace iPreGraph
                     break;
                 candidate_set.pop();
                 int current_pid = current_point_pair.second;
-                auto selected_edges = SelectEdgeLabel(current_pid, l, r, edge_limit, visited_set, label_bitmap, node_intersect_cache);
+                auto selected_edges = select_direct_edges(current_pid, l, r, edge_limit, visited_set, label_bitmap, node_intersect_cache);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -940,7 +897,7 @@ namespace iPreGraph
                     if (visited_set[neighbor_id])
                         continue;
                     visited_set[neighbor_id] = true;
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -960,11 +917,11 @@ namespace iPreGraph
                 }
                 std::vector<tableint> edges;
                 edges.reserve(edge_limit / 2);
-                DFSLabel(current_pid, l, r, edge_limit / 2, 2, edges, label_bitmap, node_intersect_cache);
+                select_cross_range_edges(current_pid, l, r, edge_limit / 2, 2, edges, label_bitmap, node_intersect_cache);
                 int num_edges1 = edges.size();
                 for (int i = 0; i < std::min(num_edges1, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges1; ++i)
                 {
@@ -972,7 +929,7 @@ namespace iPreGraph
                     if (visited_set[neighbor_id])
                         continue;
                     visited_set[neighbor_id] = true;
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < ef)
@@ -995,7 +952,7 @@ namespace iPreGraph
             return top_candidates;
         }
 
-        std::priority_queue<PFI> TopDown_nodeentries_search_filter(std::vector<TreeNodeLabel *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit)
+        std::priority_queue<PFI> search_post_filter(std::vector<TreeNodeLabel *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit)
         {
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
@@ -1013,7 +970,7 @@ namespace iPreGraph
                     continue;
                 }
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -1043,11 +1000,11 @@ namespace iPreGraph
                     break;
                 candidate_set.pop();
                 int current_pid = current_point_pair.second;
-                auto selected_edges = SelectEdge(current_pid, l, r, edge_limit, visited_set);
+                auto selected_edges = select_intra_range_edges(current_pid, l, r, edge_limit, visited_set);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -1055,7 +1012,7 @@ namespace iPreGraph
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -1085,49 +1042,18 @@ namespace iPreGraph
             return top_candidates;
         }
 
-        // 全局/类成员：标签值 -> [左边界下标, 右边界下标]
-        // 标签范围 0~999，数组大小 1000；{-1,-1} 表示该标签不存在
-        std::vector<std::pair<int, int>> label_range_map;
-
-        void precompute_label_ranges()
-        {
-            if (storage->label_arr.empty())
-                return;
-
-            // 初始化数组：1000个元素，初值 {-1,-1} 表示标签不存在
-            label_range_map.assign(1000, std::make_pair(-1, -1));
-
-            // 提取数据集中所有唯一标签
-            std::vector<int> unique_labels(storage->label_arr.begin(), storage->label_arr.end());
-            std::sort(unique_labels.begin(), unique_labels.end());
-            auto last = std::unique(unique_labels.begin(), unique_labels.end());
-            unique_labels.erase(last, unique_labels.end());
-
-            // 每个标签仅做一次 equal_range，预存区间
-            for (int label : unique_labels)
-            {
-                if (label < 0 || label >= 1000)
-                    continue;
-                auto pp = std::equal_range(storage->label_arr.begin(), storage->label_arr.end(), label);
-                int l = static_cast<int>(std::distance(storage->label_arr.begin(), pp.first));
-                int r = static_cast<int>(std::distance(storage->label_arr.begin(), pp.second)) - 1;
-                label_range_map[label] = {l, r};
-            }
-        }
-
-
-        void label_or(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
+        void benchmark_pdg(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
                       const std::string &label_json, const std::string &gt_json,
                       const std::vector<int> *vid_map = nullptr)
         {
-            std::vector<std::vector<int>> label_sets = fan_parse_json_array_of_array(label_json);
-            std::vector<std::vector<int>> gt = fan_parse_gt_json(gt_json, storage->query_nb, storage->query_K);
+            std::vector<std::vector<int>> label_sets = read_nested_integer_arrays_json(label_json);
+            std::vector<std::vector<int>> gt = load_ground_truth_json(gt_json, storage->query_nb, storage->query_K);
 
             if (flags.size() < max_elements_)
                 flags.resize(max_elements_, false);
 
             std::string savepath = saveprefix + "_label_or.csv";
-            CheckPath(savepath);
+            ensure_parent_directory(savepath);
             std::ofstream outfile(savepath);
             if (!outfile.is_open())
                 throw Exception("cannot open " + savepath);
@@ -1144,8 +1070,8 @@ namespace iPreGraph
 
                 for (int i = 0; i < storage->query_nb; i++)
                 {
-                    std::fill(flags.begin(), flags.end(), false); // 可选：清理脏数据
-                    // 1. 排序去重标签
+                    std::fill(flags.begin(), flags.end(), false); // Reset eligibility flags for this query.
+                    // Sort and deduplicate query labels.
                     std::vector<int> labels = label_sets[i];
                     std::sort(labels.begin(), labels.end());
                     labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
@@ -1160,12 +1086,12 @@ namespace iPreGraph
                         auto pp = std::equal_range(storage->label_arr.begin(),
                                                    storage->label_arr.end(), label);
                         if (pp.first == pp.second)
-                            continue; // 该标签不存在，跳过
+                            continue; // Skip labels absent from the data.
                         int cur_l = (int)(pp.first - storage->label_arr.begin());
                         int cur_r = (int)(pp.second - storage->label_arr.begin()) - 1;
                         std::fill(flags.begin() + cur_l, flags.begin() + cur_r + 1, true);
                     }
-                    // 2. 把标签集合转成 Bitmap
+                    // Convert the label set to a bitmap.
                     Bitmap label_bitmap;
                     for (int label : labels)
                     {
@@ -1186,11 +1112,11 @@ namespace iPreGraph
                     std::vector<uint8_t> node_intersect_cache;
                     node_intersect_cache.resize(TreeNodeLabel::next_id, 0);
 
-                    // 3. 调用 TopDown_nodeentries_search_Label
+                    // Run the summary-guided label search.
                     int k = storage->query_K;
                     timeval t1, t2;
                     gettimeofday(&t1, NULL);
-                    // 只需查最小值和最大值两个端点
+                    // Locate the cover using the smallest and largest query labels.
                     auto pp_min = std::equal_range(storage->label_arr.begin(),
                                                    storage->label_arr.end(), labels.front());
                     auto pp_max = std::equal_range(storage->label_arr.begin(),
@@ -1199,10 +1125,10 @@ namespace iPreGraph
                     int l = static_cast<int>(std::distance(storage->label_arr.begin(), pp_min.first));
                     int r = static_cast<int>(std::distance(storage->label_arr.begin(), pp_max.second)) - 1;
 
-                    // 一次性填充整个区间
-                    std::vector<TreeNodeLabel *> filterednodes = tree->range_filter(tree->root, l, r);
+                    // Obtain the tree nodes covering the entire interval.
+                    std::vector<TreeNodeLabel *> filterednodes = tree->find_covering_nodes(tree->root, l, r);
 
-                    std::priority_queue<PFI> res = TopDown_nodeentries_search_Label(
+                    std::priority_queue<PFI> res = search_pdg(
                         filterednodes,
                         storage->query_points[i].data(),
                         l, r,
@@ -1210,7 +1136,7 @@ namespace iPreGraph
                         label_bitmap, node_intersect_cache);
 
                     gettimeofday(&t2, NULL);
-                    auto duration = GetTime(t1, t2);
+                    auto duration = elapsed_seconds(t1, t2);
                     searchtime += duration;
 
                     std::map<int, int> record;
@@ -1221,7 +1147,7 @@ namespace iPreGraph
                         if (vid_map != nullptr)
                         {
                             if (x < 0 || (size_t)x >= vid_map->size())
-                                throw Exception("label_or: pid " + std::to_string(x) +
+                                throw Exception("benchmark_pdg: pid " + std::to_string(x) +
                                                 " out of vid_map size " +
                                                 std::to_string(vid_map->size()));
                             x = (*vid_map)[x];
@@ -1247,15 +1173,15 @@ namespace iPreGraph
             }
             outfile.close();
         }
-        void searchfilter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
+        void benchmark_post_filter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
                           const std::string &label_json, const std::string &gt_json)
         {
-            std::vector<std::vector<int>> label_sets = fan_parse_json_array_of_array(label_json);
-            std::vector<std::vector<int>> gt = fan_parse_gt_json(gt_json, storage->query_nb, storage->query_K);
+            std::vector<std::vector<int>> label_sets = read_nested_integer_arrays_json(label_json);
+            std::vector<std::vector<int>> gt = load_ground_truth_json(gt_json, storage->query_nb, storage->query_K);
 
             std::string savepath = saveprefix + "filter.csv";
             std::cout << "Savepath: " << savepath << std::endl;
-            CheckPath(savepath);
+            ensure_parent_directory(savepath);
 
             std::ofstream outfile(savepath);
             if (!outfile.is_open())
@@ -1277,7 +1203,7 @@ namespace iPreGraph
                 {
                     std::fill(flags.begin(), flags.end(), false);
 
-                    // 1. 排序去重标签
+                    // Sort and deduplicate query labels.
                     std::vector<int> labels = label_sets[i];
                     std::sort(labels.begin(), labels.end());
                     labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
@@ -1293,7 +1219,7 @@ namespace iPreGraph
                         auto pp = std::equal_range(storage->label_arr.begin(),
                                                    storage->label_arr.end(), label);
                         if (pp.first == pp.second)
-                            continue; // 该标签不存在，跳过
+                            continue; // Skip labels absent from the data.
                         int cur_l = (int)(pp.first - storage->label_arr.begin());
                         int cur_r = (int)(pp.second - storage->label_arr.begin()) - 1;
                         std::fill(flags.begin() + cur_l, flags.begin() + cur_r + 1, true);
@@ -1301,7 +1227,7 @@ namespace iPreGraph
                     timeval t1, t2;
                     gettimeofday(&t1, NULL);
 
-                    // 只需查最小值和最大值两个端点
+                    // Locate the cover using the smallest and largest query labels.
                     auto pp_min = std::equal_range(storage->label_arr.begin(),
                                                    storage->label_arr.end(), labels.front());
                     auto pp_max = std::equal_range(storage->label_arr.begin(),
@@ -1310,12 +1236,12 @@ namespace iPreGraph
                     int l = static_cast<int>(std::distance(storage->label_arr.begin(), pp_min.first));
                     int r = static_cast<int>(std::distance(storage->label_arr.begin(), pp_max.second)) - 1;
 
-                    std::vector<TreeNodeLabel *> node = tree->range_filter(tree->root, l, r);
-                    std::priority_queue<PFI> res = TopDown_nodeentries_search_filter(
+                    std::vector<TreeNodeLabel *> node = tree->find_covering_nodes(tree->root, l, r);
+                    std::priority_queue<PFI> res = search_post_filter(
                         node, storage->query_points[i].data(), l, r, ef, storage->query_K, edge_limit);
 
                     gettimeofday(&t2, NULL);
-                    searchtime += GetTime(t1, t2);
+                    searchtime += elapsed_seconds(t1, t2);
 
                     std::map<int, int> record;
                     while (res.size())

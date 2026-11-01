@@ -18,6 +18,11 @@ if(BUILD_TESTING)
     add_test(NAME irange_multi
         COMMAND irange_multi_test "${CMAKE_CURRENT_BINARY_DIR}/irange-fixtures")
 
+    add_executable(mixed_range_test mixed_range_test.cpp)
+    target_link_libraries(mixed_range_test PRIVATE ipregraph_options)
+    add_test(NAME mixed_range
+        COMMAND mixed_range_test "${CMAKE_CURRENT_BINARY_DIR}/mixed-range-fixtures")
+
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME cli_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cli_smoke_test.py"

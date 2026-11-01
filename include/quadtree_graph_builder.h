@@ -276,7 +276,7 @@ private:
         selected_inherited.reserve(std::min(degree_, candidates.size()));
         for (const auto& candidate : candidates) {
             bool keep = true;
-            // As in PruneByHeuristic2, already-pruned inherited edges do not
+            // As in prune_neighbor_candidates, already-pruned inherited edges do not
             // suppress one another. Small lists are kept up to the degree cap.
             if (candidates.size() > degree_) {
                 for (size_t i = 0; i < selected.size(); ++i) {

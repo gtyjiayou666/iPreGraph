@@ -73,9 +73,9 @@ int main(int argc, char** argv) {
                 "ANN samples distinct entries inside each query rectangle, then uses one global beam.\n"
                 "Each expanded point restarts at root and follows children containing its (x,y) attributes.\n"
                 "Neighbors come from edges[layer][point ID]; overlapping child MBRs use exact membership.\n"
-                "ANN loop follows iRG_search.h::TopDown_nodeentries_search (bitmap, heaps, lowerBound).\n"
-                "Cross-range DFS: two hops, with edge_limit / 2 additional candidates.\n"
-                "JSON layouts match search_zorder: 2 attributes, AND constraints, original row IDs.\n"
+                "ANN loop uses search_pdg (bitmap, heaps, lowerBound).\n"
+                "Cross-range select_cross_range_edges: two hops, with edge_limit / 2 additional candidates.\n"
+                "JSON layouts match benchmark_pdg: 2 attributes, AND constraints, original row IDs.\n"
                 "Output: <prefix>mixed-quadtree.csv, no header, ef,recall,qps.\n"
                 "M/data_path/attribute_file are optional consistency checks; the index contains the data.\n";
             return 0;
@@ -120,10 +120,10 @@ int main(int argc, char** argv) {
         out << std::setprecision(12);
         std::cout << "Loaded " << index.size() << " vectors, " << index.nodes().size() << " quadtree nodes, "
                   << index.level_count() << " layers (0=root).\n";
-        std::cout << "Mode: TopDown_nodeentries_search, random in-range entries -> root-to-leaf quadtree edges.\n"
+        std::cout << "Mode: search_pdg, random in-range entries -> root-to-leaf quadtree edges.\n"
                       << "entry_points=" << options.entry_points << " edge_limit=" << options.edge_limit
                       << " seed=" << options.seed << " (query seed = seed + query ID, reused across EF values).\n"
-                      << "Cross-range DFS: hop=2, cross_edge_limit=" << options.edge_limit / 2 << '\n';
+                      << "Cross-range select_cross_range_edges: hop=2, cross_edge_limit=" << options.edge_limit / 2 << '\n';
         std::cout << "Results: " << output << '\n' << std::flush;
         for (uint32_t ef : efs) {
             uint64_t tp = 0;
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
             std::cout << "Searching " << queries.size() << " queries, ef=" << ef << '\n' << std::flush;
             for (size_t qi = queries.size(); qi-- > 0;) {
                 auto per_query = options; per_query.seed += static_cast<uint32_t>(qi);
-                // Predicate preprocessing is excluded, as in search_zorder.
+                // Predicate preprocessing is excluded, as in benchmark_pdg.
                 const auto flags = index.prepare_flags(ranges[qi]);
                 // auto begin = std::chrono::steady_clock::now();
                 // Direct selection, DFS, and vector search are timed inside search().

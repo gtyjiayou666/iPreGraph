@@ -1,20 +1,25 @@
 # iPreGraph
 
-iPreGraph is a C++ implementation of filtered approximate nearest neighbor
-search with squared Euclidean (L2) distance. It combines graph traversal with
-attribute indexes for numerical range and categorical label predicates.
+iPreGraph implements filtered approximate nearest neighbor search with squared
+Euclidean (L2) distance. It builds reusable base graphs over a hierarchy of
+attribute-based object groups and selects edges during search to compose a
+predicate-dedicated graph (PDG).
 
-The repository contains a two-attribute quadtree implementation and legacy
-segment-tree variants using Z-order and label filtering. Programs in `tests/`
-include command-line builders, benchmark drivers, and a small regression test
-for the migrated iRangeGraph multi-attribute method.
+This repository contains the segment-tree implementation for numeric, label,
+and combined label/numeric experiments, the probabilistic iRangeGraph comparison
+on the same index, and a two-attribute quadtree implementation for the index
+structure comparison. The command-line drivers accept the predicate formats
+listed below; they do not provide a general SQL or Boolean-expression parser.
 
-## Build
+## Build and test
 
-Use a C++17 compiler (GCC or Clang on Linux, or a MinGW-w64 target on Windows)
-and CMake 3.23.1 or newer. Python 3 is required for the tests, which are enabled
-by default. Threads are detected by CMake; OpenMP is not required. Native MSVC
-is not supported because the timing code uses `sys/time.h`.
+Requirements:
+
+- CMake 3.23.1 or newer and a C++17 compiler.
+- GCC or Clang on Linux, or a MinGW-w64 toolchain on Windows.
+- Python 3 for the regression tests, enabled by default.
+
+Run from the repository root:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -22,276 +27,346 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-Run these commands from the repository root. Executables are written to
-`build/tests/`. HNSW headers are bundled in `include/`; no external ANN library
-installation is required. For Windows, use a MinGW-w64 toolchain and Ninja
-(for example, add `-G Ninja -DCMAKE_CXX_COMPILER=g++` to configuration).
+Executables are written to `build/tests/`. HNSW headers are bundled in `include/`;
+no external ANN library installation is required. Threads are detected by CMake;
+OpenMP is not required. Native MSVC is not supported because timing uses
+`sys/time.h`. On Windows, use a MinGW-w64 toolchain, for example with
+`-G Ninja -DCMAKE_CXX_COMPILER=g++`.
 
-Single-configuration builds default to Release. An explicit Debug or
-RelWithDebInfo configuration is honored. Enable `-DIPREGRAPH_NATIVE_ARCH=ON`
-only when binaries are intended for the build machine's CPU. To build programs
-without Python or regression tests, use `-DBUILD_TESTING=OFF`.
+Single-configuration builds default to Release. Use `-DBUILD_TESTING=OFF` to
+build without Python or regression tests. `-DIPREGRAPH_NATIVE_ARCH=ON` enables
+CPU-specific compilation for the build machine. GitHub Actions builds and tests
+with both GCC and Clang on Linux.
 
-GitHub Actions builds and runs the test suite with both GCC and Clang on Linux.
-The tests create small datasets locally; no dataset downloads are needed.
+## Experiment programs
 
-## Programs
-
-| Program | Source | Purpose |
+| Program | Purpose | Required base-vector order |
 | --- | --- | --- |
-| `build_quadtree_index` | `tests/build_quadtree_index.cpp` | Build a quadtree and graph layers; save vectors, attributes, nodes, and edges in one index. |
-| `search_quadtree` | `tests/search_quadtree.cpp` | Benchmark two numerical attributes combined with AND. |
-| `build_segment_index` | `tests/build_segment_index.cpp` | Build a legacy segment-tree graph index over the supplied vector order. |
-| `search_zorder` | `tests/search_zorder.cpp` | Search numerical attributes using Morton/Z-order bounds; choose Z-order or probabilistic iRangeGraph traversal. |
-| `search_zorder_label` | `tests/search_zorder_label.cpp` | Search label OR and numerical range AND predicates using `(z_code, label)` order. |
-| `search_label` | `tests/search_label.cpp` | Search categorical label OR predicates supplied as JSON. |
-| `search_mixed` | `tests/search_mixed.cpp` | Search label OR and numerical range AND predicates using `(label, z_code)` order. |
+| `build_segment_index` | Build hierarchical base graphs over the supplied row order. | The order required by the search driver. |
+| `search_zorder` | Numeric range conjunctions; `--method zorder` or `--method irange`. | Morton/Z-order over all numeric attributes. |
+| `search_label` | Membership in a query label set. | Ascending label. |
+| `search_zorder_label` | Label membership AND numeric range constraints. | `(Morton code, label)`. |
+| `search_mixed` | Label membership AND numeric range constraints. | `(label, Morton code)`. |
+| `build_quadtree_index` | Build the quadtree comparison index. | Any order; original row IDs are preserved. |
+| `search_quadtree` | Two numeric range constraints combined with AND. | The order stored in the quadtree index. |
 
-`search_mixed` uses `(label, z_code)` row order and is built from
-`tests/search_mixed.cpp`. Ground truth is optional; when supplied, its shape must
-match the loaded query count and `--query_K`.
+Program sources have the same names under `tests/`. The quadtree is an
+alternative index structure; it is not needed to run the segment-tree methods.
+External baselines such as ACORN, NaviX, and Faiss-IVFPQ are not bundled here.
 
-## Quadtree input formats
+## Prepare the data
 
-Point IDs are zero-based base-vector row numbers. Attributes must use the same
-row order as the base vectors. The quadtree preserves original IDs and requires
-no Z-order sorting.
+### Vectors and IDs
 
-### Vectors
+All segment-tree programs use a little-endian binary vector file:
 
-Both formats below use little-endian values:
+```text
+int32 vector_count
+int32 dimension
+float32 vectors[vector_count][dimension]
+```
 
-| Format | Layout |
-| --- | --- |
-| `fvecs` | Each vector has an `int32` dimension followed by that many `float32` components. |
-| `bin` | One `int32` count and one `int32` dimension, followed by all `float32` vectors in row-major order. |
+The quadtree programs also accept `fvecs`, where each vector is preceded by its
+own `int32` dimension. Their `--data_format auto` and `--query_format auto` options
+select `fvecs` for `.fvecs` files and the binary layout above otherwise.
 
-`--data_format auto` and `--query_format auto` select `fvecs` for the `.fvecs`
-extension and `bin` for other extensions. Set the format explicitly if the
-extension does not match the contents. Base and query dimensions must match.
+Object IDs are zero-based base-vector row numbers. Before building a segment-tree
+index, sort the base vectors and attributes together and remap ground-truth IDs
+to the new row order. Keep query vectors, query predicates, and ground-truth
+query rows aligned. Sorting the base does not require changing query vectors or
+predicate values. The index builder does not perform attribute sorting.
 
-### Attributes and ranges
+For Morton sorting, use the encoding in
+`encode_morton_key` and compare keys with `morton_key_less`
+in `include/multi_attribute_utils.h`. Attribute 0 contributes the least-significant
+bit of each interleaved bit plane; multiword keys support more than 64 bits.
+Numeric attributes used by the segment-tree drivers must be non-negative integers.
 
-Attributes contain two finite numbers per base vector. Flat and nested numeric
-JSON arrays are accepted. For example, three attribute rows are:
+### Attributes and predicates
+
+Numeric-only attributes contain one integer per dimension and object. Flat or
+nested JSON arrays are accepted. A two-attribute example is:
 
 ```json
 [[10, 100], [20, 200], [30, 300]]
 ```
 
-Ranges contain exactly four numbers per query in the order
-`xmin, xmax, ymin, ymax`. Bounds are inclusive and combined with AND.
-One query rectangle can be written as:
+Each numeric query supplies one inclusive `[low, high]` pair per attribute;
+all pairs are combined with AND:
 
 ```json
 [[[10, 30], [100, 250]]]
 ```
 
-This selects points with the first attribute in `[10, 30]` and the second in
-`[100, 250]`. Nested arrays are flattened in row-major order.
+For label-only search, attributes contain the label column selected by
+`--label_col`. With `--attr_num 1 --label_col 0`, an attribute file can be
+`[0, 0, 1, 3, 3]`. A query file lists the allowed labels for each query:
 
-### Ground truth
-
-Provide exactly `query_count * query_K` integer IDs in flat or nested JSON
-arrays. Each query row contains its exact nearest qualifying neighbors. Use `-1`
-to pad rows with fewer than `query_K` matches. Other IDs must exist, be unique
-within a row, and satisfy that query's rectangle. Recall is divided by
-`query_count * query_K`, including padded slots.
-
-## Quadtree quick start
-
-### Build an index
-
-Create the index output directory, then run:
-
-```bash
-mkdir -p indexes
-./build/tests/build_quadtree_index \
-  --data_path data/base.fvecs \
-  --attribute_file data/attributes.json \
-  --index_file indexes/tree.qidx \
-  --M 16 --ef_construction 100 \
-  --leaf_size 32 --max_depth 32 --threads 8
+```json
+[[0, 3], [1]]
 ```
 
-As an alternative to JSON, use `--attr_path data/attributes.csv` with two numeric
-columns per row and no header. Supply exactly one attribute input option.
-
-The tree partitions points by count and constructs approximate relative
-neighborhood graphs from leaves to root. Graph edges are stored by tree depth
-and original point ID. The saved `.qidx` contains vectors and attributes, so
-queries do not need the original base files.
-
-| Build option | Default | Meaning |
-| --- | --- | --- |
-| `--M` | `16` | Maximum graph degree. |
-| `--ef_construction` | `100` | Candidate search budget during construction. |
-| `--leaf_size` | `32` | Point-count threshold for a leaf. |
-| `--max_depth` | `32` | Maximum tree depth. |
-| `--threads` | `1` | Construction worker count. |
-| `--progress` | `1` | Set to `0` to disable construction progress. |
-
-### Run a query benchmark
-
-```bash
-./build/tests/search_quadtree \
-  --index_file indexes/tree.qidx \
-  --query_path data/query.fvecs \
-  --range_saveprefix data/ranges.json \
-  --groundtruth_saveprefix data/groundtruth.json \
-  --result_saveprefix results/run_ \
-  --query_K 10 --ef 100,70,50,30,10 \
-  --entry_points 5 --edge_limit 16 --seed 42 \
-  --recall_stop 0
-```
-
-Despite their names, `--range_saveprefix` and `--groundtruth_saveprefix` take
-complete JSON file paths. `--result_saveprefix` is an output prefix: this example
-creates `results/run_mixed-quadtree.csv`, including its parent directory.
-
-Each output row has no header and contains `ef,recall,qps`. The default
-`--recall_stop` is `0.9`: the driver stops after writing the first row below that
-recall. Set it to `0` to evaluate every supplied EF value. Larger EF values allow
-a wider search beam and generally increase query cost.
-
-`--entry_points` defaults to `5` distinct qualifying starting points.
-`--edge_limit` defaults to the index's `M` and is shared across tree levels for
-each expanded point. The query seed is `seed + query ID`, reused across EF
-values. Search can traverse out-of-range points for up to two DFS hops to find
-qualifying candidates.
-
-Reported search time covers graph traversal. Eligibility preprocessing,
-entry-point sampling, loading, and result evaluation are outside the timed
-region. Optional `--data_path`, `--attribute_file`, and `--M` arguments check
-consistency with the saved index. Both quadtree programs support `--help`.
-
-## Legacy segment-tree workflow
-
-Legacy programs read vectors in the `bin` layout described above. Build the
-index over the exact vector order used by the search driver:
-
-```bash
-./build/tests/build_segment_index \
-  --data_path data/base_sorted.bin \
-  --index_file indexes/segment.bin \
-  --M 16 --ef_construction 250 --threads 8
-```
-
-The legacy index and `.qidx` formats are not interchangeable. Keep `--M`
-consistent between construction and search.
-
-For `search_zorder`, sort vectors and their numerical attributes by
-the Morton codes computed by `CalculateMultiAttributeZOrder` before building.
-Use non-negative integer attributes and regenerate ground-truth IDs for the
-sorted row order. The default is two attributes; set `--attr_num A` for other
-dimensions. Each query supplies `A` inclusive `[low, high]` pairs combined with
-AND, so flattened query rows contain `2 * A` integers.
-
-```bash
-./build/tests/search_zorder \
-  --data_path data/base_sorted.bin --query_path data/query.bin \
-  --attribute_file data/attributes_sorted.json \
-  --range_saveprefix data/ranges.json \
-  --groundtruth_saveprefix data/groundtruth.json \
-  --index_file indexes/segment.bin \
-  --result_saveprefix results/zorder_ --M 16 --query_K 10
-```
-
-### iRangeGraph multi-attribute search
-
-The same executable exposes the migrated iRangeGraph method with
-`--method irange`. Omitting `--method` retains the existing `zorder` method.
-For example, with four numerical attributes:
-
-```bash
-./build/tests/search_zorder \
-  --data_path data/base_sorted.bin --query_path data/query.bin \
-  --attribute_file data/attributes_4d.json --attr_num 4 \
-  --range_saveprefix data/ranges_4d.json \
-  --groundtruth_saveprefix data/groundtruth.json \
-  --index_file indexes/segment.bin \
-  --result_saveprefix results/irange_ --M 16 --query_K 10 \
-  --method irange
-```
-
-This method uses the existing Morton row ordering and segment-tree graph.
-All numerical intervals must hold for a point to enter the result heap.
-Nonmatching points inside the Morton cover may be explored as transit vertices,
-with acceptance probability `1 / (1 + exp(step))`; a matching point resets
-that step counter. `MaxStep` defaults to 20. This is an approximate search and
-preserves the source implementation's early stopping rule.
-
-The header exposes `search_irange`, `TopDown_nodeentries_search_mutil`,
-`SelectEdgeMutil`, and `setprob` on `iPreGraph_Search_Zorder`. The original
-`mutil` spelling is kept for method compatibility. The low-level search initializes
-its probability table when needed. Its optional seed controls entry selection;
-transit sampling uses the C `rand()` state. Set both when comparing seeded runs.
-
-Output is `<prefix>mixed-irange.csv` with no header and columns
-`ef,recall,qps,dco,hops`. The EF sweep stops below recall 0.9, as in the source
-method. Predicate flags are cached outside the timed loop and require about
-`base_count * query_count` bytes per query domain. Timing includes Morton bounds,
-entry selection, and graph traversal; it excludes flag preparation and evaluation.
-
-Legacy EF lists are defined in the driver source files. CSV suffixes and metric
-columns vary by search method; consult the corresponding search header when
-processing results.
-
-For label OR search, `search_label` takes `--attr_json`, `--label_json`,
-and `--groundtruth_json`, along with vector, index, result, `--M`, and `--query_K`
-arguments. Attributes must be ordered by the selected label column because
-matching label blocks are located by binary search. `--attr_num` defaults to
-`3`; `--label_col` defaults to `0`. Query labels are a JSON array of label lists.
-
-`search_zorder_label` expects three attribute columns: a label in column
-zero and two numerical attributes. Sort rows by `(z_code, label)`. Each query
-contains a label list followed by one closed range per numerical attribute:
+For hybrid search, the default attribute layout is `[label, a0, a1]`. Each query
+contains a label list followed by the inclusive numeric ranges:
 
 ```json
 [[[3, 7], [10, 20], [100, 200]]]
 ```
 
-This means `(label = 3 OR label = 7) AND (10 <= a0 <= 20) AND
-(100 <= a1 <= 200)`. The standalone mixed driver uses the same predicate shape
-but requires `(label, z_code)` row order. Keep vectors, attributes, index rows,
-and ground-truth IDs aligned whenever data is reordered.
+This represents `(label = 3 OR label = 7) AND (10 <= a0 <= 20) AND
+(100 <= a1 <= 200)`. `search_mixed` accepts `--attr_num` and `--label_col`;
+`search_zorder_label` currently fixes three columns with the label in column 0.
 
-## Tests
+### Ground truth
 
-The self-contained test creates synthetic 2D and 4D data, including Morton codes
-wider than 64 bits. It checks exact full-range results on complete graphs,
-predicate validity, duplicate IDs, empty results, input validation, and CSV output.
-It also checks aligned allocation and deallocation. The CLI smoke test builds
-actual segment-tree and quadtree indexes and queries all search variants against
-independent exact nearest-neighbor results, including an empty mixed predicate.
-These checks do not require downloaded datasets or measure performance.
+Ground-truth JSON contains `query_count * query_K` integer IDs, either flat or
+nested by query. IDs must refer to the base order used by that index. Use `-1`
+for missing results when fewer than `query_K` objects qualify. Reported recall
+uses `query_count * query_K` as its denominator, including padded slots.
+
+Ground truth is required by the supplied drivers except `search_mixed`, which
+reports recall as `-1` when `--groundtruth_json` is omitted.
+
+## Segment-tree experiments
+
+### Build the index
 
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --parallel 2
-ctest --test-dir build --output-on-failure
+mkdir -p indexes results
+./build/tests/build_segment_index \
+  --data_path data/numeric/base_sorted.bin \
+  --index_file indexes/numeric.bin \
+  --M 40 --ef_construction 1000 --threads 64
 ```
+
+Build a separate index for each base-vector ordering used below, changing
+`--data_path` and `--index_file` accordingly. Keep `--M` consistent between
+construction and search. The segment-tree index stores adjacency lists; search
+also requires the base-vector and attribute files. Segment summaries are built
+when the index is loaded, rather than stored in the adjacency file.
+
+### Numeric filtering
+
+```bash
+./build/tests/search_zorder \
+  --data_path data/numeric/base_sorted.bin \
+  --query_path data/query.bin \
+  --attribute_file data/numeric/attributes_sorted.json \
+  --range_saveprefix data/numeric/ranges.json \
+  --groundtruth_saveprefix data/numeric/groundtruth.json \
+  --index_file indexes/numeric.bin \
+  --result_saveprefix results/numeric_ \
+  --M 40 --query_K 10 --attr_num 2 --method zorder
+```
+
+For four numeric attributes, use `--attr_num 4` with the corresponding sorted
+base, attributes, four-attribute predicates, ground truth, and index. The
+`--range_saveprefix` and `--groundtruth_saveprefix` arguments are complete JSON
+file paths despite their names.
+
+To run the iRangeGraph comparison, use the same command with `--method irange`.
+This adaptation uses the same Morton-sorted segment-tree index and applies the
+full numeric predicate to results. It probabilistically explores non-qualifying
+points within the covering range. It is not an independently built index sorted
+by a single numeric attribute.
+
+### Label filtering
+
+Build `indexes/labels.bin` over `data/labels/base_sorted.bin`, sorted by label.
+For a file containing only the label attribute:
+
+```bash
+./build/tests/search_label \
+  --data_path data/labels/base_sorted.bin \
+  --query_path data/query.bin \
+  --attr_json data/labels/attributes_sorted.json \
+  --label_json data/labels/queries.json \
+  --groundtruth_json data/labels/groundtruth.json \
+  --index_file indexes/labels.bin \
+  --result_saveprefix results/labels \
+  --M 40 --query_K 10 --attr_num 1 --label_col 0
+```
+
+For multi-column attribute files, specify the actual `--attr_num` and label
+column. The selected label column must be nondecreasing in base-vector order.
+
+### Hybrid filtering: Z-order first
+
+Build `indexes/hybrid_z.bin` using vectors sorted by `(Morton code, label)`.
+The attribute file has three columns: label, numeric attribute 0, numeric
+attribute 1.
+
+```bash
+./build/tests/search_zorder_label \
+  --data_path data/hybrid_z/base_sorted.bin \
+  --query_path data/query.bin \
+  --attribute_file data/hybrid_z/attributes_sorted.json \
+  --range_saveprefix data/hybrid/queries.json \
+  --groundtruth_saveprefix data/hybrid_z/groundtruth.json \
+  --index_file indexes/hybrid_z.bin \
+  --result_saveprefix results/hybrid_z \
+  --M 40 --query_K 10
+```
+
+### Hybrid filtering: label first
+
+Build `indexes/hybrid_label.bin` using vectors sorted by `(label, Morton code)`.
+It can use the same query predicates as the Z-order-first experiment, but requires
+its own remapped ground-truth IDs.
+
+```bash
+./build/tests/search_mixed \
+  --data_path data/hybrid_label/base_sorted.bin \
+  --query_path data/query.bin \
+  --attr_json data/hybrid_label/attributes_sorted.json \
+  --query_json data/hybrid/queries.json \
+  --groundtruth_json data/hybrid_label/groundtruth.json \
+  --index_file indexes/hybrid_label.bin \
+  --result_saveprefix results/hybrid_label \
+  --M 40 --query_K 10 --attr_num 3 --label_col 0
+```
+
+### Search settings and additional method interfaces
+
+Segment-tree EF lists are defined in the corresponding `tests/search_*.cpp`
+files. In particular, `search_zorder_label` currently runs only `ef=20`; edit its
+`SearchEF` list and rebuild to obtain a recall/QPS curve. These drivers do not
+currently expose an `--ef` command-line option. With ground truth supplied, their
+EF sweeps stop after recording a row with recall below 0.90.
+
+The following experiment-related methods remain available in the headers but
+are not selected by the current command-line drivers:
+
+| Method | Interface |
+| --- | --- |
+| Numeric Post-filter | `iPreGraph_Search_Zorder::benchmark_post_filter` in `include/search_zorder.h`. |
+| Label Post-filter | `iPreGraph_Search_Label::benchmark_post_filter` in `include/search_label.h`. |
+| Label-first hybrid Post-filter | `iPreGraph_Search_Mixed::benchmark_post_filter` in `include/search_mixed.h`. |
+| Label range merging | `search_merged_ranges` and `merge_small_gaps` in `include/search_label.h`. |
+
+Calling these methods requires selecting them in a driver and rebuilding. There
+is no command-line switch for range merging or tree fanout in the supplied
+segment-tree drivers. Removed experimental prototypes and old binary-range
+loaders are no longer part of the public source tree.
+
+## Quadtree structure comparison
+
+Quadtree attributes contain exactly two finite numeric values per object. The
+index retains the supplied row IDs and stores vectors, attributes, nodes, and
+edges together. No Morton sorting is required, and its `.qidx` format is distinct
+from the segment-tree adjacency format.
+
+```bash
+./build/tests/build_quadtree_index \
+  --data_path data/base.fvecs \
+  --attribute_file data/attributes.json \
+  --index_file indexes/tree.qidx \
+  --M 40 --ef_construction 1000 \
+  --leaf_size 32 --max_depth 32 --threads 64
+
+./build/tests/search_quadtree \
+  --index_file indexes/tree.qidx \
+  --query_path data/query.fvecs \
+  --range_saveprefix data/ranges.json \
+  --groundtruth_saveprefix data/groundtruth.json \
+  --result_saveprefix results/quadtree_ \
+  --query_K 10 --ef 100,70,50,30,10 \
+  --entry_points 5 --edge_limit 40 --seed 42 --recall_stop 0
+```
+
+Query rectangles use the same two-attribute JSON layout as numeric filtering.
+Ground-truth IDs must refer to the input order used to build this quadtree.
+A CSV attribute file with two columns and no header can be supplied through
+`--attr_path` instead of `--attribute_file`.
+
+Both quadtree programs support `--help`. Build defaults are `M=16`,
+`ef_construction=100`, `leaf_size=32`, `max_depth=32`, and `threads=1`.
+Search defaults to five qualifying entry points, `edge_limit=M`, and `seed=42`.
+The default `--recall_stop 0.9` ends the EF sweep after the first row below 0.90;
+set it to `0` to run the full sweep. `--progress 0` disables build progress.
+
+## Results and measurement
+
+`--result_saveprefix` is an output prefix, not a directory. Parent directories
+are created as needed. CSV files have no header:
+
+| Driver or mode | Suffix appended to the prefix | Columns |
+| --- | --- | --- |
+| `search_zorder --method zorder` | `mixed-zorder_ways.csv` | `ef,recall,qps,dco,hop` |
+| `search_zorder --method irange` | `mixed-irange.csv` | `ef,recall,qps,dco,hop` |
+| `search_label` | `_label_or.csv` | `ef,recall,qps,dco,hop` |
+| `search_zorder_label` | `_zorder_label_memory.csv` | `ef,recall,qps,dco,hop` |
+| `search_mixed` | `_mixed.csv` | `ef,recall,qps,dco,hop` |
+| `search_quadtree` | `mixed-quadtree.csv` | `ef,recall,qps` |
+
+`dco` and `hop` are the recorded distance-computation and expansion counters per
+query. The `mixed` prefix in numeric output names is the loader's query-domain
+key; it does not indicate a label/numeric predicate.
+
+Object-level predicate flags and input/index loading are outside the reported
+query timer. Segment-summary tests and graph traversal run during search.
+Segment-tree timing also includes the range-location and entry-selection work
+inside each method's timed interval. The quadtree timer excludes entry-point
+sampling. Consult the timing boundaries in the relevant search method when
+comparing results. The iRangeGraph benchmark caches predicate flags for all
+queries in a domain, requiring approximately `base_count * query_count` bytes.
+
+`build_segment_index` prints graph construction time in seconds before index
+serialization. For total process time and peak resident memory on Linux, run
+the desired command with `/usr/bin/time -v`. Peak RSS covers the entire process,
+including loading. When reporting segment-tree disk usage including vectors,
+add the base-vector file size to the saved adjacency-file size; MBRs and bitmaps
+are reconstructed in memory. The quadtree file already contains its vectors.
+
+## Regression tests
+
+`irange_multi_test` covers two- and four-attribute predicates, Morton keys wider
+than 64 bits, predicate validity, duplicate IDs, empty results, input validation,
+and aligned memory allocation. `mixed_range_test` checks direct-edge range
+bounds and correct range selection after cross-range transitions.
+`cli_smoke_test.py` builds small segment-tree and
+quadtree indexes and runs all exposed search modes against independently computed
+ground truth. Tests generate their own data and do not measure full-dataset
+performance.
+
+## Function naming
+
+Project-owned functions use `snake_case`. Class names, executable names, CLI
+options, index formats, and CSV suffixes are unchanged. Bundled HNSW APIs retain
+their upstream names.
+
+| Name or prefix | Responsibility |
+| --- | --- |
+| `search_pdg`, `search_irange`, `search_post_filter` | Run one ANN query. |
+| `benchmark_pdg`, `benchmark_irange`, `benchmark_post_filter` | Run the query/EF loops and write benchmark metrics. |
+| `select_direct_edges` | Select direct qualifying neighbors using segment summaries. |
+| `select_intra_range_edges` | Select neighbors restricted to one position range. |
+| `select_cross_range_edges` | Collect qualifying endpoints through bounded DFS. |
+| `select_cross_range_edges_from_ranges` | Guide that DFS with an explicit range set. |
+| `may_match_*` | Return `true` when a segment cannot be rejected by its summary. |
+| `load_*`, `parse_*`, `validate_*` | Read inputs, parse values, and check invariants. |
+
+Function names identify their current roles; earlier prototype names such as
+`DFS_new1`, `SelectEdgeMutil`, and `TopDown_nodeentries_search_or_Pro` have been
+replaced. Code calling those C++ interfaces must use the new names. Existing
+command-line experiment scripts do not need to change.
 
 ## Code map
 
-Project-owned source files use lowercase `snake_case` names. Headers use `.h`,
-program sources use `.cpp`, and regression tests use the `_test.cpp` suffix.
-Names identify the operation or component: `search_*`, `build_*`, `*_builder`,
-and `*_utils`. Bundled HNSW headers retain their upstream names. Executable names
-match their source filenames without the `.cpp` suffix (plus `.exe` on Windows).
-
 | File | Responsibility |
 | --- | --- |
-| `include/quadtree_index.h` | Tree partitioning, persistence, predicate flags, and filtered traversal. |
-| `include/quadtree_graph_builder.h` | Bottom-up graph construction and a reusable worker pool. |
-| `include/quadtree_cli.h` | Quadtree options and validated vector/JSON/CSV input. |
-| `include/quadtree_progress.h` | Construction progress reporting. |
-| `include/segment_graph_builder.h` | Legacy segment-tree graph construction. |
-| `include/segment_tree_utils.h`, `include/multi_attribute_utils.h` | Legacy loaders, attribute structures, and Morton encoding. |
-| `include/search_zorder.h`, `include/search_zorder_label.h`, `include/search_label.h`, `include/search_mixed.h`, `include/search_multi.h` | Legacy filtered search variants. |
-| `include/search_containers.h`, `include/memory_utils.h` | Search containers, aligned allocation, and prefetch helpers. |
+| `include/segment_graph_builder.h` | Segment-tree base-graph construction and serialization. |
+| `include/segment_tree_utils.h` | Vector/label loaders, segment trees, and label bitmaps. |
+| `include/multi_attribute_utils.h` | Numeric summaries, JSON loaders, and Morton encoding. |
+| `include/search_zorder.h` | Numeric iPreGraph search, iRangeGraph comparison, and Post-filter. |
+| `include/search_label.h` | Label search, Post-filter, and range merging. |
+| `include/search_zorder_label.h` | Z-order-first hybrid search. |
+| `include/search_mixed.h` | Label-first hybrid search and Post-filter. |
+| `include/quadtree_index.h`, `include/quadtree_graph_builder.h` | Quadtree construction, persistence, and search. |
+| `include/quadtree_cli.h`, `include/quadtree_progress.h` | Quadtree input handling and progress reporting. |
+| `include/search_containers.h`, `include/memory_utils.h` | Visited flags, aligned allocation, and prefetch helpers. |
 | `include/hnswlib.h`, `include/hnswalg.h`, `include/space_*.h` | Bundled HNSW interfaces and distance kernels. |
 
 ## License
 
-The repository includes the Apache License, Version 2.0; see [LICENSE](LICENSE).
+See [LICENSE](LICENSE) for the Apache License, Version 2.0.

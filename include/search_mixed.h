@@ -11,40 +11,21 @@
 #include <climits>
 #include <algorithm>
 
-// ============================================================================
-// search_mixed.h —— 支持"标签 + 数值"混合属性的向量近似近邻检索
-//
-// 数据组织（与已有 label / zorder 两套方案对齐）：
-//   数据点先按标签（label）升序排列；标签相同的点再按数值属性的 z-order 码升序排列，
-//   即全局顺序为 (label, z_code) 字典序。因此：
-//     - 每个标签在数组中是连续区间（可用 equal_range 定位）；
-//     - 每个标签内部 z-code 单调不减。
-// 树节点（TreeNodeMixed）维护剪枝信息：
-//    1. label_bmp : 节点范围内出现过的标签位图（子节点并集，精确）；
-//    2. label_mbrs : 每个出现过的标签各自的数值包围盒（int32 紧凑，按 label 升序），
-//       外加联合盒；剪枝时先位图、再联合盒、再逐"命中标签"盒，比单一 MBR 更强。
-// 查询语义：标签集合（标签间 OR）+ 数值属性范围（属性间 AND）。
-// 查询流程：
-//   1) 查询前定候选区间 [l, r]：数据按 (label, z) 全局字典序排序、查询标签集升序，
-//      只需处理第一个和最后一个查询标签：
-//        l = 最小查询标签块内第一个 z >= q_z_min 的点（块内满足数值约束的最小值）
-//        r = 最大查询标签块内最后一个 z <= q_z_max 的点（块内满足数值约束的最大值）
-//      块边界由 BuildLabelBlocks 预建（O(1)），块内 z 单调用 STL 定位；
-//      角点 z 区间 [q_z_min, q_z_max] 是数值约束的安全近似（数值命中的点 z 必落在其内），
-//      故 [l,r] 覆盖全部真值点，非命中点由点级 flags 过滤兜底。
-//   2) 检索过程中节点剪枝（均安全，不会剪掉含真值点的节点）：
-//        label_bmp ∩ 查询标签位图 ≠ ∅  且  联合盒 ∩ 查询MBR ≠ ∅
-//        且  ∃命中标签：该标签的 MBR ∩ 查询MBR ≠ ∅
-// ============================================================================
+// Mixed predicates combine label membership with numerical range conjunctions.
+// Rows are ordered by (label, Morton code). Each query label contributes a
+// conservative Morton cover; point-level flags enforce the complete predicate.
+// Segment summaries are reconstructed when the index is loaded. Active numeric
+// pruning reads the joint MBR; stored label bitmaps and per-label bounds remain
+// part of the runtime representation.
 
 namespace iPreGraph_mixed
 {
-    // segment_tree_utils.h 中 tableint / linklistsizeint 定义于 iPreGraph 命名空间，这里引入以便裸用
+    // Import the shared graph ID and adjacency-list types.
     using iPreGraph::linklistsizeint;
     using iPreGraph::tableint;
 
     // ------------------------------------------------------------------------
-    // 混合属性树节点
+    // Mixed-attribute segment-tree node.
     // ------------------------------------------------------------------------
     class TreeNodeMixed
     {
@@ -55,14 +36,13 @@ namespace iPreGraph_mixed
         int range_id;
         std::vector<TreeNodeMixed *> childs;
 
-        iPreGraph::Bitmap label_bmp; // 节点范围内出现过的标签（并集）
+        iPreGraph::Bitmap label_bmp; // Labels present in this segment.
 
-        // 每标签数值包围盒（int32 紧凑，替代原 double MBR；仅存出现过的标签）：
-        //   label_mbr_data 扁平存储，每个标签 (1 + 2*z_attr_dim) 个 int：
-        //   [label, mn[0..dim), mx[0..dim)]，按 label 升序。
-        //   20 标签场景：底层节点 1 个标签（1 条 20B），高层最多 20 条（400B）。
+        // Per-label numeric bounds, stored as packed int entries for labels present.
+        // Each entry contains 1 + 2*z_attr_dim integers:
+        // [label, min[0..dim), max[0..dim)], ordered by label.
         std::vector<int> label_mbr_data;
-        std::vector<int> joint_mn; // 联合盒（全部标签盒的并），第一道快速拒绝
+        std::vector<int> joint_mn; // Joint numeric MBR used for segment rejection.
         std::vector<int> joint_mx;
 
         TreeNodeMixed(int l, int r, int d, int z_attr_dim)
@@ -74,15 +54,15 @@ namespace iPreGraph_mixed
     };
 
     // ------------------------------------------------------------------------
-    // 混合属性线段树：树形与 SegmentTree / SegmentTreeZorder 完全一致（ways_=2），
-    // 保证层级与图索引的 layer 导航对齐。
+    // Binary segment tree matching the graph index partitioning.
+    // Node depths identify the corresponding graph layers.
     // ------------------------------------------------------------------------
     class SegmentTreeMixed
     {
     public:
         int ways_ = 2;
-        int z_attr_dim_ = 2; // 数值属性列数
-        int node_count{0};   // 已创建的节点数（同时作为 node_id 分配器）
+        int z_attr_dim_ = 2; // Number of numeric attribute columns.
+        int node_count{0};   // Node count and next node ID.
         TreeNodeMixed *root{nullptr};
         int max_depth{-1};
         std::vector<TreeNodeMixed *> treenodes;
@@ -96,10 +76,10 @@ namespace iPreGraph_mixed
             root->node_id = node_count++;
         }
 
-        // 输入数据必须已按 (label, z_code) 排序：
-        //   labels : N 个标签，非递减；
-        //   z_attrs: N × z_attr_dim 非负整数数值属性（混合排序后的顺序）。
-        void BuildTree(TreeNodeMixed *u,
+        // Input rows must be sorted by (label, Morton code).
+        // labels: N nondecreasing label IDs.
+        // z_attrs: N rows of nonnegative integer numeric attributes in the same order.
+        void build_tree(TreeNodeMixed *u,
                        const std::vector<int> &labels,
                        const std::vector<std::vector<int>> &z_attrs)
         {
@@ -114,7 +94,7 @@ namespace iPreGraph_mixed
 
             if (L == R)
             {
-                // 叶子：范围内只有该点
+                // A leaf contains one object.
                 u->label_bmp.set(labels[L]);
                 u->label_mbr_data.push_back(labels[L]);
                 for (int d = 0; d < z_attr_dim_; d++)
@@ -144,15 +124,15 @@ namespace iPreGraph_mixed
                 TreeNodeMixed *childnode = new TreeNodeMixed(l, r, u->depth + 1, z_attr_dim_);
                 childnode->node_id = node_count++;
                 u->childs.emplace_back(childnode);
-                BuildTree(childnode, labels, z_attrs);
+                build_tree(childnode, labels, z_attrs);
                 l = r + 1;
             }
 
-            // 内部节点：标签位图取子节点并集；每标签 MBR 按 label 归并合并
+            // merge child label bitmaps and per-label bounds.
             u->label_bmp.reset();
             for (const auto *ch : u->childs)
                 u->label_bmp.union_with(ch->label_bmp);
-            // 联合盒 = 子节点联合盒合并
+            // merge child joint MBRs.
             for (int d = 0; d < z_attr_dim_; d++)
             {
                 u->joint_mn[d] = std::numeric_limits<int>::max();
@@ -166,7 +146,7 @@ namespace iPreGraph_mixed
                     u->joint_mx[d] = std::max(u->joint_mx[d], ch->joint_mx[d]);
                 }
             }
-            // 每标签 MBR：子节点各按 label 升序（ways_=2 恒两个子节点），双指针归并
+            // merge the two sorted per-label bound arrays.
             const size_t stride = 1 + 2 * (size_t)z_attr_dim_;
             const auto &A = u->childs[0]->label_mbr_data;
             const auto &B = u->childs[1]->label_mbr_data;
@@ -201,8 +181,8 @@ namespace iPreGraph_mixed
             }
         }
 
-        // 与 SegmentTree / SegmentTreeZorder 同语义：按 pid 区间 [ql,qr] 返回覆盖它的最少节点集合
-        std::vector<TreeNodeMixed *> range_filter(TreeNodeMixed *u, int ql, int qr)
+        // Return the minimal disjoint tree-node cover of the position range [ql,qr].
+        std::vector<TreeNodeMixed *> find_covering_nodes(TreeNodeMixed *u, int ql, int qr)
         {
             std::vector<TreeNodeMixed *> res;
             if (u == nullptr)
@@ -216,7 +196,7 @@ namespace iPreGraph_mixed
             }
             for (auto child : u->childs)
             {
-                auto t = range_filter(static_cast<TreeNodeMixed *>(child), ql, qr);
+                auto t = find_covering_nodes(static_cast<TreeNodeMixed *>(child), ql, qr);
                 res.insert(res.end(), t.begin(), t.end());
             }
             return res;
@@ -232,8 +212,8 @@ namespace iPreGraph_mixed
     };
 
     // ------------------------------------------------------------------------
-    // 混合属性数据装载：向量 + 标签 + 数值属性（z-code），以及查询的标签集合与数值范围
-    // 约定：data_points / labels / z_attrs / z_codes 均已按 (label, z_code) 排序。
+    // Load mixed attributes, query vectors, constraints, and ground truth.
+    // Base rows and attributes share (label, Morton code) ordering.
     // ------------------------------------------------------------------------
     // Parse mixed predicates and enforce (label, Morton code) row ordering.
     class MixedDataLoader
@@ -241,14 +221,14 @@ namespace iPreGraph_mixed
     public:
         int Dim{0}, query_nb{0}, query_K{0}, data_nb{0};
         std::vector<std::vector<float>> query_points;
-        std::vector<std::vector<float>> data_points;                 // 混合排序后的底库向量
-        std::vector<int> labels;                                     // 混合排序后的标签（非递减）
-        std::vector<std::vector<int>> z_attrs;                       // 混合排序后的数值属性 N×D
-        std::vector<iPreGraph_multi::MultiAttributeZCode> z_codes; // 混合排序后的 z-code
-        std::vector<int> label_block_start;                          // label_block_start[label] = 该标签块起点（-1 表示不存在）
-        std::vector<int> label_block_end;                            // label_block_end[label]   = 该标签块终点（-1 表示不存在）
+        std::vector<std::vector<float>> data_points;                 // Base vectors in mixed order.
+        std::vector<int> labels;                                     // Nondecreasing labels in mixed order.
+        std::vector<std::vector<int>> z_attrs;                       // Numeric attributes in mixed order (N by D).
+        std::vector<iPreGraph_multi::MultiAttributeZCode> z_codes; // Morton codes in mixed order.
+        std::vector<int> label_block_start;                          // First row of each label block; -1 if absent.
+        std::vector<int> label_block_end;                            // Last row of each label block; -1 if absent.
 
-        // 每条查询：标签集合（OR）+ 数值范围约束（AND）
+        // Each query combines label membership (OR) with numeric intervals (AND).
         std::vector<std::vector<int>> query_labels;
         std::vector<Attr_Constraint> query_constraints;
 
@@ -256,11 +236,11 @@ namespace iPreGraph_mixed
         ~MixedDataLoader() {}
 
         // ------------------------------------------------------------------
-        // 简单 JSON 工具：仅解析本仓库数据文件用到的格式（数组 + 整数），
-        // 不做通用 JSON 支持（不含字符串/对象/小数）。
+        // Parse the integer-array JSON formats used by the input files.
+        // Strings, objects, and fractional numbers are not supported.
         // ------------------------------------------------------------------
-        // 扁平整数数组："[v0, v1, ..., vn-1]"
-        static std::vector<int> ParseJsonFlatInts(const std::string &s)
+        // Extract integers from a flat array such as [v0, v1, ..., vn-1].
+        static std::vector<int> parse_flat_json_integers(const std::string &s)
         {
             std::vector<int> out;
             out.reserve(s.size() / 4);
@@ -281,7 +261,7 @@ namespace iPreGraph_mixed
                         i++;
                     }
                     if (v > 2147483647LL)
-                        throw Exception("ParseJsonFlatInts: int overflow");
+                        throw Exception("parse_flat_json_integers: int overflow");
                     out.push_back(neg ? (int)-v : (int)v);
                 }
                 else
@@ -292,15 +272,15 @@ namespace iPreGraph_mixed
             return out;
         }
 
-        // 嵌套整数数组解析（仅支持数组 + 整数）：
-        //   "[v0, v1, ...]" / "[[..],[..]]" 等任意深度
+        // Parse nested integer arrays.
+        // Arrays may contain integers or further arrays at any depth.
         struct JsonArr
         {
-            std::vector<int> ints;       // 本层直接包含的整数（叶子层）
-            std::vector<JsonArr> childs; // 本层嵌套的子数组
+            std::vector<int> ints;       // Integers directly contained in this array.
+            std::vector<JsonArr> childs; // Nested arrays.
         };
 
-        static long long ParseJsonInt(const std::string &s, size_t &i, size_t n)
+        static long long parse_json_integer(const std::string &s, size_t &i, size_t n)
         {
             bool neg = false;
             if (s[i] == '-')
@@ -317,49 +297,49 @@ namespace iPreGraph_mixed
             return neg ? -v : v;
         }
 
-        // 前提：s[i] == '['
-        static JsonArr ParseJsonArr(const std::string &s, size_t &i, size_t n)
+        // Precondition: s[i] == '['.
+        static JsonArr parse_json_array(const std::string &s, size_t &i, size_t n)
         {
             JsonArr out;
-            i++; // 跳过 '['
+            i++; // Skip '['.
             while (i < n && s[i] != ']')
             {
                 if (s[i] == '[')
                 {
-                    out.childs.push_back(ParseJsonArr(s, i, n));
+                    out.childs.push_back(parse_json_array(s, i, n));
                 }
                 else if (s[i] == '-' || (s[i] >= '0' && s[i] <= '9'))
                 {
-                    long long v = ParseJsonInt(s, i, n);
+                    long long v = parse_json_integer(s, i, n);
                     if (v > 2147483647LL || v < -2147483648LL)
-                        throw Exception("ParseJsonArr: int out of range");
+                        throw Exception("parse_json_array: int out of range");
                     out.ints.push_back((int)v);
                 }
                 else
                 {
-                    i++; // 空白 / 逗号等
+                    i++; // Skip whitespace, commas, and other separators.
                 }
             }
             if (i < n)
-                i++; // 跳过 ']'
+                i++; // Skip ']'.
             return out;
         }
 
-        static JsonArr ParseJson(const std::string &s)
+        static JsonArr parse_json(const std::string &s)
         {
             size_t i = 0;
             if (i >= s.size() || s[i] != '[')
-                throw Exception("ParseJson: expected '[' at start");
-            return ParseJsonArr(s, i, s.size());
+                throw Exception("parse_json: expected '[' at start");
+            return parse_json_array(s, i, s.size());
         }
 
         // ------------------------------------------------------------------
-        // 属性文件加载：扁平 JSON 数组 [l0,a0,b0, l1,a1,b1, ...]（每点 attr_nb 列，
-        // 已按 (label, z_code) 排序）。label_col 为标签所在列，其余列为数值属性。
-        // 加载后自动计算 z-code 并做排序不变量校验。
-        // n_points <= 0 时自动从文件推导（int 总数 / attr_nb，需整除）。
+        // Load attr_nb integer columns per row; label_col selects the label.
+        // All other columns are numeric attributes. Rows must be in mixed order.
+        // Compute Morton codes and label-block boundaries; the index validates order.
+        // Infer n_points from the integer count when n_points <= 0.
         // ------------------------------------------------------------------
-        void LoadAttrJson(const std::string &filename, int n_points, int attr_nb, int label_col)
+        void load_attributes_json(const std::string &filename, int n_points, int attr_nb, int label_col)
         {
             std::ifstream in(filename, std::ios::in | std::ios::binary);
             if (!in.is_open())
@@ -368,19 +348,19 @@ namespace iPreGraph_mixed
                                 std::istreambuf_iterator<char>());
             in.close();
 
-            std::vector<int> vals = ParseJsonFlatInts(content);
+            std::vector<int> vals = parse_flat_json_integers(content);
             if (attr_nb <= 0)
-                throw Exception("LoadAttrJson: attr_nb must be > 0");
+                throw Exception("load_attributes_json: attr_nb must be > 0");
             if (vals.size() % attr_nb != 0)
-                throw Exception("LoadAttrJson: int count " + std::to_string(vals.size()) +
+                throw Exception("load_attributes_json: int count " + std::to_string(vals.size()) +
                                 " not divisible by attr_nb " + std::to_string(attr_nb));
             if (n_points <= 0)
                 n_points = (int)(vals.size() / attr_nb);
             else if ((int)vals.size() != n_points * attr_nb)
-                throw Exception("LoadAttrJson: expected " + std::to_string(n_points * attr_nb) +
+                throw Exception("load_attributes_json: expected " + std::to_string(n_points * attr_nb) +
                                 " ints, got " + std::to_string(vals.size()));
             if (label_col < 0 || label_col >= attr_nb)
-                throw Exception("LoadAttrJson: label_col out of range");
+                throw Exception("load_attributes_json: label_col out of range");
 
             data_nb = n_points;
             int n_num = attr_nb - 1;
@@ -397,19 +377,19 @@ namespace iPreGraph_mixed
                         continue;
                     int v = vals[p * attr_nb + c];
                     if (v < 0)
-                        throw Exception("LoadAttrJson: numeric attrs must be non-negative for z-order");
+                        throw Exception("load_attributes_json: numeric attrs must be non-negative for z-order");
                     z_attrs[p][k++] = v;
                 }
-                z_codes[p] = iPreGraph_multi::CalculateMultiAttributeZOrder(z_attrs[p]);
+                z_codes[p] = iPreGraph_multi::encode_morton_key(z_attrs[p]);
             }
-            BuildLabelBlocks();
+            build_label_blocks();
         }
 
         // ------------------------------------------------------------------
-        // 查询文件加载：[[标签列表, [lo1,hi1], [lo2,hi2], ...], ...]
-        // 每条查询 = 标签集合（OR）+ 若干数值范围（AND）。
+        // Query format: [[label_list, [lo1,hi1], [lo2,hi2], ...], ...].
+        // Labels are alternatives; all numeric intervals must hold.
         // ------------------------------------------------------------------
-        void LoadQueryRangeJson(const std::string &filename)
+        void load_hybrid_predicates_json(const std::string &filename)
         {
             std::ifstream in(filename, std::ios::in | std::ios::binary);
             if (!in.is_open())
@@ -418,18 +398,18 @@ namespace iPreGraph_mixed
                                 std::istreambuf_iterator<char>());
             in.close();
 
-            JsonArr root = ParseJson(content);
+            JsonArr root = parse_json(content);
             query_nb = (int)root.childs.size();
             query_labels.resize(query_nb);
             query_constraints.resize(query_nb);
             for (int q = 0; q < query_nb; q++)
             {
-                const JsonArr &query = root.childs[q]; // 一条查询 = [标签列表, [lo,hi], ...]
+                const JsonArr &query = root.childs[q]; // One query: [label_list, [lo,hi], ...].
                 if (query.childs.empty())
                     continue;
-                // 第 1 个元素：标签列表
+                // The first array contains requested labels.
                 query_labels[q] = query.childs[0].ints;
-                // 其余元素：数值范围 [lo, hi]
+                // Remaining arrays contain inclusive numeric bounds [lo,hi].
                 for (size_t k = 1; k < query.childs.size(); k++)
                 {
                     const auto &r = query.childs[k].ints;
@@ -438,56 +418,11 @@ namespace iPreGraph_mixed
                     query_constraints[q].attr_constraints.emplace_back(r[0], r[1]);
                 }
             }
-            PrintQueryLabelStats();
         }
 
-        // ------------------------------------------------------------------
-        // 查询标签统计：打印所有查询中的 label 数量信息
-        //   - 查询数、总标签引用数、每条查询标签数 min/max/均值
-        //   - 每个标签被引用的查询数（频次）
-        // ------------------------------------------------------------------
-        void PrintQueryLabelStats() const
-        {
-            if (query_nb == 0)
-                return;
-            long long total_refs = 0;
-            int perq_min = INT_MAX, perq_max = 0;
-            int max_label = -1;
-            for (const auto &ql : query_labels)
-            {
-                total_refs += (long long)ql.size();
-                perq_min = std::min(perq_min, (int)ql.size());
-                perq_max = std::max(perq_max, (int)ql.size());
-                for (int l : ql)
-                    max_label = std::max(max_label, l);
-            }
-            // 直方图：标签数量为 k 的查询数（k = 1..perq_max）
-            std::vector<int> hist(perq_max + 1, 0);
-            for (const auto &ql : query_labels)
-                hist[ql.size()]++;
-            std::vector<int> label_freq(max_label + 1, 0);
-            for (const auto &ql : query_labels)
-                for (int l : ql)
-                    if (l >= 0 && l <= max_label)
-                        label_freq[l]++;
-            printf("query label stats: queries=%d total_label_refs=%lld "
-                   "labels_per_query[min=%d max=%d avg=%.2f]\n",
-                   query_nb, total_refs, perq_min, perq_max,
-                   (double)total_refs / query_nb);
-            printf("  label-count histogram (#queries with k labels):");
-            for (size_t k = 1; k < hist.size(); k++)
-                if (hist[k] > 0)
-                    printf(" k=%zu:%d", k, hist[k]);
-            printf("\n");
-            printf("  label usage freq:");
-            for (size_t l = 0; l < label_freq.size(); l++)
-                printf(" %d:%d", (int)l, label_freq[l]);
-            printf("\n");
-        }
-
-        // ---- helpers for label_or: read integer payloads from JSON/text files ----
-        // 读取整个文件为字符串
-        static std::string fan_read_whole_file(const std::string &filename)
+        // Read integer payloads from JSON/text files.
+        // Read the complete file into a string.
+        static std::string read_text_file(const std::string &filename)
         {
             std::ifstream in(filename);
             if (!in.is_open())
@@ -497,10 +432,10 @@ namespace iPreGraph_mixed
             return buf.str();
         }
 
-        // 解析 [[...],[...],[...]] 形式，保留外层分组，内层是整数列表
-        static std::vector<std::vector<int>> fan_parse_json_array_of_array(const std::string &filename)
+        // Parse nested integer lists while preserving query groups.
+        static std::vector<std::vector<int>> read_nested_integer_arrays_json(const std::string &filename)
         {
-            const std::string s = fan_read_whole_file(filename);
+            const std::string s = read_text_file(filename);
             const std::string who = filename;
             std::vector<std::vector<int>> out;
             size_t i = 0;
@@ -533,7 +468,7 @@ namespace iPreGraph_mixed
                 throw Exception("JSON parse error in " + who + ": outer structure must be an array");
             ++i;
             skip_ws();
-            if (i < s.size() && s[i] == ']') // 顶层为空 []
+            if (i < s.size() && s[i] == ']') // Empty outer array.
             {
                 ++i;
                 return out;
@@ -548,7 +483,7 @@ namespace iPreGraph_mixed
                 skip_ws();
                 if (i < s.size() && s[i] == ']')
                 {
-                    ++i; // 允许空标签列表 []
+                    ++i; // Allow an empty inner list.
                 }
                 else
                 {
@@ -590,8 +525,8 @@ namespace iPreGraph_mixed
             return out;
         }
 
-        // 从文本里顺序提取所有整数（用于 label range 文件：label l r 三元组）
-        static std::vector<int> fan_parse_all_ints(const std::string &text, const std::string &who)
+        // Extract integers from flat ground-truth input.
+        static std::vector<int> parse_integer_values(const std::string &text, const std::string &who)
         {
             std::vector<int> out;
             size_t i = 0;
@@ -615,11 +550,11 @@ namespace iPreGraph_mixed
                 }
                 if (!has_digit)
                 {
-                    // 单独的 +/- 号，跳过
+                    // Skip a standalone sign.
                     ++i;
                     continue;
                 }
-                // 若数字后紧跟小数点或指数，说明不是整数，明确报错
+                // Reject fractional or scientific notation.
                 if (i < text.size() && (text[i] == '.' || text[i] == 'e' || text[i] == 'E'))
                     throw Exception("non-integer number in " + who);
                 std::string token = text.substr(start, i - start);
@@ -634,12 +569,12 @@ namespace iPreGraph_mixed
         }
 
         // ------------------------------------------------------------------
-        // 真值文件加载：[[pid,...],[pid,...],...]（每条查询一个 pid 列表，
-        // pid 为混合排序后的底库下标，与 search_label 的 gt 口径一致）。
+        // Load ground-truth IDs, grouped by query or flattened.
+        // IDs refer to base rows in mixed order.
         // ------------------------------------------------------------------
-        static std::vector<std::vector<int>> LoadGtJson(const std::string &filename, int query_nb, int query_K)
+        static std::vector<std::vector<int>> load_ground_truth_json(const std::string &filename, int query_nb, int query_K)
         {
-            const std::string s = fan_read_whole_file(filename);
+            const std::string s = read_text_file(filename);
             size_t i = 0;
             while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])))
                 ++i;
@@ -655,7 +590,7 @@ namespace iPreGraph_mixed
 
             if (nested)
             {
-                std::vector<std::vector<int>> gt = fan_parse_json_array_of_array(filename);
+                std::vector<std::vector<int>> gt = read_nested_integer_arrays_json(filename);
                 if ((int)gt.size() != query_nb)
                     throw Exception("ground truth file " + filename + ": " + std::to_string(gt.size()) +
                                     " groups, but query_nb = " + std::to_string(query_nb));
@@ -665,7 +600,7 @@ namespace iPreGraph_mixed
 
             if (query_nb <= 0 || query_K <= 0)
                 throw Exception("ground truth file " + filename + ": flat format needs valid query_nb and query_K");
-            std::vector<int> v = fan_parse_all_ints(s, filename);
+            std::vector<int> v = parse_integer_values(s, filename);
             if ((long long)v.size() != (long long)query_nb * query_K)
                 throw Exception("ground truth file " + filename + ": " + std::to_string(v.size()) +
                                 " integers, expected query_nb * query_K = " +
@@ -678,11 +613,11 @@ namespace iPreGraph_mixed
             return gt;
         }
         // ------------------------------------------------------------------
-        // 标签块边界：数据按 (label, z) 字典序排列，每个标签在数组中是一个
-        // 连续块。预先构建 label_block_start/end，检索时 O(1) 取块边界，
-        // 无需任何二分。幂等：已构建则直接返回。
+        // Each label occupies one contiguous block in mixed order.
+        // Cache block boundaries for constant-time lookup during search.
+        // Return immediately if boundaries are already populated.
         // ------------------------------------------------------------------
-        void BuildLabelBlocks()
+        void build_label_blocks()
         {
             if (!label_block_start.empty() || labels.empty())
                 return;
@@ -711,30 +646,30 @@ namespace iPreGraph_mixed
         }
 
         // ------------------------------------------------------------------
-        // 排序不变量校验（(label, z_code) 字典序）：
-        //   1) 标签非递减；2) 标签内 z-code 非递减。
-        // 违反契约将导致候选区间 [l,r] 计算错误，故违反时抛异常。
+        // Validate lexicographic (label, Morton code) ordering:
+        // labels must be nondecreasing, as must Morton codes within each label.
+        // Reject invalid ordering before computing query covers.
         // ------------------------------------------------------------------
-        void ValidateMixedOrder() const
+        void validate_label_morton_order() const
         {
             const int n = (int)labels.size();
             if (n == 0)
                 return;
             if ((int)z_codes.size() != n || (int)z_attrs.size() != n)
-                throw Exception("ValidateMixedOrder: labels/z_attrs/z_codes size mismatch");
+                throw Exception("validate_label_morton_order: labels/z_attrs/z_codes size mismatch");
             for (int i = 1; i < n; i++)
             {
                 if (labels[i] < labels[i - 1])
-                    throw Exception("ValidateMixedOrder: labels not non-decreasing "
+                    throw Exception("validate_label_morton_order: labels not non-decreasing "
                                     "(data must be sorted by label first)");
                 if (labels[i] == labels[i - 1] &&
-                    iPreGraph_multi::MultiAttributeZOrderLess(z_codes[i], z_codes[i - 1]))
-                    throw Exception("ValidateMixedOrder: z-codes not non-decreasing within a label "
+                    iPreGraph_multi::morton_key_less(z_codes[i], z_codes[i - 1]))
+                    throw Exception("validate_label_morton_order: z-codes not non-decreasing within a label "
                                     "(data must be z-order sorted within each label)");
             }
         }
 
-        void LoadQuery(std::string filename)
+        void load_query_vectors(std::string filename)
         {
             std::ifstream infile(filename, std::ios::in | std::ios::binary);
             if (!infile.is_open())
@@ -750,26 +685,11 @@ namespace iPreGraph_mixed
             infile.close();
         }
 
-        void LoadData(std::string filename)
-        {
-            std::ifstream infile(filename, std::ios::in | std::ios::binary);
-            if (!infile.is_open())
-                throw Exception("cannot open " + filename);
-            infile.read((char *)&data_nb, sizeof(int));
-            infile.read((char *)&Dim, sizeof(int));
-            data_points.resize(data_nb);
-            for (int i = 0; i < data_nb; i++)
-            {
-                data_points[i].resize(Dim);
-                infile.read((char *)data_points[i].data(), Dim * sizeof(float));
-            }
-            infile.close();
-        }
     };
 
 
     // ============================================================================
-    // 混合属性 ANN 检索
+    // Mixed-attribute ANN search.
     // ============================================================================
     template <typename dist_t>
     class iPreGraph_Search_Mixed
@@ -799,7 +719,7 @@ namespace iPreGraph_mixed
 
         int prefetch_lines{0};
 
-        std::vector<bool> flags; // 点级混合过滤：flags[pid] = 满足全部约束（标签 ∧ 数值）
+        std::vector<bool> flags; // Complete point-level predicate: label membership and numeric bounds.
 
         iPreGraph_Search_Mixed(std::string vectorfilename, std::string edgefilename,
                                  MixedDataLoader *store, int M)
@@ -819,9 +739,9 @@ namespace iPreGraph_mixed
 
             z_attr_dim_ = storage->z_attrs.empty() ? 0 : storage->z_attrs[0].size();
             tree = new SegmentTreeMixed((int)max_elements_, (int)z_attr_dim_);
-            tree->BuildTree(tree->root, storage->labels, storage->z_attrs);
-            // 检索正确性依赖 (label, z_code) 字典序契约，加载后立即校验
-            storage->ValidateMixedOrder();
+            tree->build_tree(tree->root, storage->labels, storage->z_attrs);
+            // Validate the mixed row ordering required by search.
+            storage->validate_label_morton_order();
 
             space = new hnswlib::L2Space(dim_);
             fstdistfunc_ = space->get_dist_func();
@@ -843,9 +763,9 @@ namespace iPreGraph_mixed
             {
                 for (int layer = 0; layer <= tree->max_depth; layer++)
                 {
-                    linklistsizeint *data = get_linklist(pid, layer);
+                    linklistsizeint *data = get_adjacency_list(pid, layer);
                     edgefile.read((char *)data, sizeof(tableint));
-                    int size = getListCount(data);
+                    int size = get_neighbor_count(data);
                     if (size > (int)M_out)
                         throw Exception("real linklist size is bigger than defined M_out");
                     for (int i = 0; i < size; i++)
@@ -854,7 +774,7 @@ namespace iPreGraph_mixed
                         edgefile.read(current_neighbor_, sizeof(tableint));
                     }
                 }
-                char *data = getDataByInternalId(pid);
+                char *data = get_vector_data(pid);
                 vectorfile.read(data, dim_ * sizeof(float));
             }
 
@@ -876,22 +796,22 @@ namespace iPreGraph_mixed
             }
         }
 
-        inline char *getDataByInternalId(tableint internal_id) const
+        inline char *get_vector_data(tableint internal_id) const
         {
             return (data_memory_ + internal_id * size_data_per_element_ + offsetData_);
         }
 
-        linklistsizeint *get_linklist(tableint internal_id, int layer) const
+        linklistsizeint *get_adjacency_list(tableint internal_id, int layer) const
         {
             return (linklistsizeint *)(data_memory_ + internal_id * size_data_per_element_ + layer * size_links_per_layer_);
         }
 
-        int getListCount(linklistsizeint *ptr) const
+        int get_neighbor_count(linklistsizeint *ptr) const
         {
             return *((int *)ptr);
         }
 
-        int GetOverLap(int l, int r, int ql, int qr)
+        int interval_overlap_span(int l, int r, int ql, int qr)
         {
             int L = std::max(l, ql);
             int R = std::min(r, qr);
@@ -899,20 +819,11 @@ namespace iPreGraph_mixed
         }
 
 
-        // 数值剪枝（单区间场景专用）：区间内只对应一个查询标签，标签约束恒真，
-        // 跳过 label∩ 判断，仅 joint MBR∩ + 任一标签盒 ∩ wq ≠ ∅。
-        // （比 NodePrune 宽松：不按标签过滤盒，仅作为数值维度的剪枝手段）
-        inline bool NodePruneNumeric(const TreeNodeMixed *u,
+        // Reject segments whose joint numeric MBR misses the query box.
+        inline bool may_match_numeric_bounds(const TreeNodeMixed *u,
                                      const iPreGraph_multi::MBR &wq) const
         {
-            // int nid = u->node_id;
-            // uint8_t c = node_cache[nid];
-            // if (c != 0)
-            //     return c == 1;
-
-            // bool res = false;
             const size_t dim = u->joint_mn.size();
-            // bool joint_ok = true;
             for (size_t d = 0; d < dim; d++)
             {
                 if (u->joint_mn[d] > (int)wq.max_vals[d] ||
@@ -922,356 +833,22 @@ namespace iPreGraph_mixed
                 }
             }
             return true;
-            // if (joint_ok)
-            // {
-            //     const size_t stride = 1 + 2 * dim;
-            //     for (size_t i = 0; i + stride <= u->label_mbr_data.size(); i += stride)
-            //     {
-            //         bool box_ok = true;
-            //         for (size_t d = 0; d < dim; d++)
-            //         {
-            //             int mn = u->label_mbr_data[i + 1 + d];
-            //             int mx = u->label_mbr_data[i + 1 + dim + d];
-            //             if (mn > (int)wq.max_vals[d] ||
-            //                 (int)wq.min_vals[d] > mx)
-            //             {
-            //                 box_ok = false;
-            //                 break;
-            //             }
-            //         }
-            //         if (box_ok)
-            //         {
-            //             res = true;
-            //             break;
-            //         }
-            //     }
-            // }
-
-            // node_cache[nid] = res ? 1 : 2;
-            // return res;
         }
 
-        // 点级混合过滤：filter_map[pid] = 满足全部约束（标签命中 ∧ 数值命中）
-        inline bool PointPass(int pid,
+        // Point flags combine label membership and all numeric constraints.
+        inline bool point_matches_predicate(int pid,
                               const std::vector<bool> &filter_map) const
         {
             return filter_map[pid];
         }
 
         // ------------------------------------------------------------------------
-        // 边选择：在 (label,z) 混合树上导航，读取 pid 所在深度的邻接表，
-        // 仅保留"标签命中 + 数值命中"且未被访问的邻居。
-        // ------------------------------------------------------------------------
-        std::vector<tableint> SelectEdgeMixed(int pid, int ql, int qr, int edge_limit,
-                                              searcher::Bitset<uint64_t> &visited_set,
-                                              const iPreGraph_multi::MBR &wq,
-                                              const std::vector<bool> &filter_map)
-        {
-            TreeNodeMixed *cur_node = nullptr, *nxt_node = tree->root;
-            std::vector<tableint> selected_edges;
-            selected_edges.reserve(edge_limit);
-            do
-            {
-                cur_node = nxt_node;
-                bool contain = false;
-                // 沿包含 pid 的子树下降，直到 [ql,qr] 交叠不再扩大
-                do
-                {
-                    contain = false;
-                    if (cur_node->childs.size() == 0)
-                        nxt_node = nullptr;
-                    else
-                    {
-                        for (int i = 0; i < (int)cur_node->childs.size(); ++i)
-                        {
-                            if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
-                            {
-                                nxt_node = cur_node->childs[i];
-                                break;
-                            }
-                        }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) ==
-                            GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
-                        {
-                            cur_node = nxt_node;
-                            contain = true;
-                        }
-                    }
-                } while (contain);
-
-                // 当前节点被混合剪枝剪掉 -> 其子树不可能含真值点，直接返回
-                if (!NodePruneNumeric(cur_node, wq))
-                    return selected_edges;
-
-                // 若兄弟子树与查询无交叠，继续沿 pid 所在子树下降
-                do
-                {
-                    contain = false;
-                    if (cur_node->childs.size() == 0)
-                        nxt_node = nullptr;
-                    else
-                    {
-                        for (int i = 0; i < (int)cur_node->childs.size(); ++i)
-                        {
-                            if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
-                            {
-                                nxt_node = cur_node->childs[i];
-                            }
-                            else
-                            {
-                                if (!NodePruneNumeric(cur_node->childs[i], wq))
-                                    contain = true;
-                            }
-                        }
-                        if (contain)
-                            cur_node = nxt_node;
-                    }
-                } while (contain);
-
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
-                for (size_t j = 1; j <= size; ++j)
-                {
-                    int neighborId = *(data + j);
-                    if (visited_set.get(neighborId))
-                        continue;
-                    if (!PointPass(neighborId, filter_map))
-                        continue;
-                    selected_edges.emplace_back(neighborId);
-                    if (selected_edges.size() == (size_t)edge_limit)
-                        return selected_edges;
-                }
-            } while (nxt_node);
-            return selected_edges;
-        }
-
-        // ------------------------------------------------------------------------
-        // DFS：沿邻接表向下再探索两层，同样只收集"标签命中 + 数值命中"的点
-        // start_node 非空时从该节点继续（跳过从 root 的第一段下降，用于
-        // 多区间 DFS 收缩到单区间后就地转交，避免重复扫描）；
-        // skip_label_check=true 时仅做数值剪枝（单区间内标签约束恒真）。
-        // ------------------------------------------------------------------------
-        void DFSMixed(int pid, int ql, int qr, int edge_limit, int deep,
-                      std::vector<tableint> &edges,
-                      const iPreGraph_multi::MBR &wq,
-                      const std::vector<bool> &filter_map)
-        {
-            TreeNodeMixed *cur_node = tree->root;
-            TreeNodeMixed *nxt_node = nullptr;
-            bool contain = false;
-            do
-            {
-                contain = false;
-                if (cur_node->childs.size() == 0)
-                    nxt_node = nullptr;
-                else
-                {
-                    for (int i = 0; i < (int)cur_node->childs.size(); ++i)
-                    {
-                        if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
-                        {
-                            nxt_node = cur_node->childs[i];
-                            break;
-                        }
-                    }
-                    if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) ==
-                        GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
-                    {
-                        cur_node = nxt_node;
-                        contain = true;
-                    }
-                }
-            } while (contain);
-            while (cur_node)
-            {
-                if (!NodePruneNumeric(cur_node, wq))
-                    break;
-
-                bool inters = false;
-                if (cur_node->childs.size() == 0)
-                    nxt_node = nullptr;
-                else
-                {
-                    for (int i = 0; i < (int)cur_node->childs.size(); ++i)
-                    {
-                        if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
-                        {
-                            nxt_node = cur_node->childs[i];
-                        }
-                        else
-                        {
-                            if (NodePruneNumeric(cur_node->childs[i], wq))
-                                inters = true;
-                        }
-                    }
-                }
-
-                if (inters)
-                {
-                    int *data = (int *)get_linklist(pid, cur_node->depth);
-                    size_t size = getListCount((linklistsizeint *)data);
-                    for (size_t j = 1; j <= size; ++j)
-                    {
-                        int neighborId = *(data + j);
-                        if (PointPass(neighborId, filter_map))
-                        {
-                            edges.emplace_back(neighborId);
-                        }
-                        else if (deep > 1)
-                        {
-                            DFSMixed(neighborId, ql, qr, edge_limit / 2, deep - 1,
-                                     edges, wq, filter_map);
-                        }
-                        if ((int)edges.size() >= edge_limit)
-                            return;
-                    }
-                }
-                cur_node = nxt_node;
-            }
-        }
-
-        // ------------------------------------------------------------------------
-        // 顶层搜索：从过滤后的树节点随机取进入点，贪心扩展（HNSW 风格）
-        // ------------------------------------------------------------------------
-        std::priority_queue<PFI> TopDown_nodeentries_search_mixed(
-            std::vector<TreeNodeMixed *> &filterednodes,
-            const void *query_data,
-            int l, int r, int ef, int query_k, int edge_limit,
-            const iPreGraph_multi::MBR &wq,
-            const std::vector<bool> &filter_map)
-        {
-            unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-            std::default_random_engine e(seed);
-            std::priority_queue<PFI, std::vector<PFI>, std::greater<PFI>> candidate_set;
-            std::priority_queue<PFI> top_candidates;
-            searcher::Bitset<uint64_t> visited_set(max_elements_);
-
-            float lowerBound = std::numeric_limits<float>::max();
-
-            // 进入点：每个过滤节点内随机取一点（仅真值点进入 top_candidates）
-            for (auto u : filterednodes)
-            {
-                std::uniform_int_distribution<int> u_start(u->lbound, u->rbound);
-                int pid = u_start(e);
-                if (visited_set.get(pid))
-                    continue;
-                visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
-                float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
-                ++metric_distance_computations;
-                if (top_candidates.size() < ef)
-                {
-                    candidate_set.emplace(dis, pid);
-                    if (PointPass(pid, filter_map))
-                    {
-                        top_candidates.emplace(dis, pid);
-                        lowerBound = top_candidates.top().first;
-                    }
-                }
-                else if (dis < lowerBound)
-                {
-                    candidate_set.emplace(dis, pid);
-                    if (PointPass(pid, filter_map))
-                    {
-                        top_candidates.emplace(dis, pid);
-                        top_candidates.pop();
-                        lowerBound = top_candidates.top().first;
-                    }
-                }
-            }
-
-            while (!candidate_set.empty())
-            {
-                auto current_point_pair = candidate_set.top();
-                ++metric_hops;
-                if (current_point_pair.first > lowerBound)
-                    break;
-                candidate_set.pop();
-                int current_pid = current_point_pair.second;
-
-                auto selected_edges = SelectEdgeMixed(current_pid, l, r, edge_limit, visited_set,
-                                                      wq, filter_map);
-                int num_edges = (int)selected_edges.size();
-                for (int i = 0; i < std::min(num_edges, 3); ++i)
-                {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
-                }
-                for (int i = 0; i < num_edges; ++i)
-                {
-                    int neighbor_id = selected_edges[i];
-                    if (visited_set.get(neighbor_id))
-                        continue;
-                    visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
-                    float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
-                    ++metric_distance_computations;
-
-                    if (top_candidates.size() < ef)
-                    {
-                        candidate_set.emplace(dis, neighbor_id);
-                        top_candidates.emplace(dis, neighbor_id);
-                        lowerBound = top_candidates.top().first;
-                    }
-                    else if (dis < lowerBound)
-                    {
-                        candidate_set.emplace(dis, neighbor_id);
-                        top_candidates.emplace(dis, neighbor_id);
-                        top_candidates.pop();
-                        lowerBound = top_candidates.top().first;
-                    }
-                }
-
-                // DFS 补充探索
-                std::vector<tableint> edges;
-                edges.reserve(edge_limit / 2);
-                DFSMixed(current_pid, l, r, edge_limit / 2, 2, edges, wq, filter_map);
-                int num_edges1 = (int)edges.size();
-                for (int i = 0; i < std::min(num_edges1, 3); ++i)
-                {
-                    memory::mem_prefetch_L1(getDataByInternalId(edges[i]), this->prefetch_lines);
-                }
-                for (int i = 0; i < num_edges1; ++i)
-                {
-                    int neighbor_id = edges[i];
-                    if (visited_set.get(neighbor_id))
-                        continue;
-                    visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
-                    float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
-                    ++metric_distance_computations;
-                    if (top_candidates.size() < ef)
-                    {
-                        candidate_set.emplace(dis, neighbor_id);
-                        top_candidates.emplace(dis, neighbor_id);
-                        lowerBound = top_candidates.top().first;
-                    }
-                    else if (dis < lowerBound)
-                    {
-                        candidate_set.emplace(dis, neighbor_id);
-                        top_candidates.emplace(dis, neighbor_id);
-                        top_candidates.pop();
-                        lowerBound = top_candidates.top().first;
-                    }
-                }
-            }
-
-            while ((int)top_candidates.size() > query_k)
-                top_candidates.pop();
-            return top_candidates;
-        }
-
-        // ------------------------------------------------------------------------
-        // 以下为"多区间 OR"检索组件，移植自 iRG_search_or.h 的
-        //   SelectEdge / DFS_new1 / TopDown_nodeentries_search_or_Pro，
-        // 适配 TreeNodeMixed（SelectEdgeMixedOr 保留 NodePrune 树下降剪枝）：
-        // 查询预处理得到多个候选区间 Q_L/Q_R（每个查询标签一个区间，即大区间，
-        // 无需 MergeSmallGaps 合并），检索时按区间导航，
-        // flags（满足全部约束）只过滤最终 top_candidates。
+        // Unified search over per-label Morton covers. Direct and DFS edge
+        // selection retain endpoints that pass the complete predicate.
         // ------------------------------------------------------------------------
 
-        // 多区间候选点比较器：针对 iPreGraph_multi::PFIORPRO 的小顶堆
-        // （dis 小的优先；segment_tree_utils.h 的 iPreGraph::Compare 接受的是
-        //  iPreGraph::PFIORPRO，类型不同，故在本地定义）
+        // Min-heap comparator for iPreGraph_multi::PFIORPRO.
+        // The shared iPreGraph::Compare accepts a different PFIORPRO type.
         struct ComparePFIORPRO
         {
             bool operator()(const iPreGraph_multi::PFIORPRO &a,
@@ -1281,13 +858,10 @@ namespace iPreGraph_mixed
             }
         };
 
-        // 边选择（方法同 SelectEdgeMixed，剪枝用数值 MBR）：
-        // 沿树下降到 [ql,qr] 内，兄弟子树被数值剪枝剪掉则继续沿 pid 子树下潜，
-        // 收集时 PointPass 过滤——只收满足全部约束且未被访问的邻居。
-        // 调用场景为单标签区间（主循环传 Q_L[range_id]/Q_R[range_id]，区间内
-        // 全是同一标签的点）：标签约束恒真，故树下降剪枝用 NodePruneNumeric
-        // （数值 MBR 剪枝，剪掉必不满足数值约束的子树）。
-        std::vector<tableint> SelectEdgeMixedOr(int pid, int ql, int qr, int edge_limit,
+        // Use the position cover for layer skipping and numeric MBRs for pruning.
+        // Retain unvisited endpoints inside this cover that satisfy the complete predicate.
+        // The caller supplies one label cover for each expansion.
+        std::vector<tableint> select_direct_edges(int pid, int ql, int qr, int edge_limit,
                                                 searcher::Bitset<uint64_t> &visited_set,
                                                 const iPreGraph::Bitmap &label_bmp,
                                                 const iPreGraph_multi::MBR &wq,
@@ -1301,7 +875,7 @@ namespace iPreGraph_mixed
             {
                 cur_node = nxt_node;
                 bool contain = false;
-                // 沿包含 pid 的子树下降，直到 [ql,qr] 交叠不再扩大
+                // Skip layers whose child preserves the cover intersection.
                 do
                 {
                     contain = false;
@@ -1317,8 +891,8 @@ namespace iPreGraph_mixed
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) ==
-                            GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) ==
+                            interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -1326,11 +900,11 @@ namespace iPreGraph_mixed
                     }
                 } while (contain);
 
-                // 当前节点被数值 MBR 剪枝剪掉 -> 其子树不可能含真值点，直接返回
-                if (!NodePruneNumeric(cur_node, wq))
+                // No numeric match exists in this segment or its descendants.
+                if (!may_match_numeric_bounds(cur_node, wq))
                     return selected_edges;
 
-                // 若兄弟子树与查询数值范围无交叠，继续沿 pid 所在子树下降
+                // Skip this layer when the sibling MBR misses the query box.
                 do
                 {
                     contain = false;
@@ -1346,7 +920,7 @@ namespace iPreGraph_mixed
                             }
                             else
                             {
-                                if (!NodePruneNumeric(cur_node->childs[i], wq))
+                                if (!may_match_numeric_bounds(cur_node->childs[i], wq))
                                     contain = true;
                             }
                         }
@@ -1355,14 +929,16 @@ namespace iPreGraph_mixed
                     }
                 } while (contain);
 
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
+                    if (neighborId < ql || neighborId > qr)
+                        continue;
                     if (visited_set.get(neighborId))
                         continue;
-                    if (!PointPass(neighborId, filter_map))
+                    if (!point_matches_predicate(neighborId, filter_map))
                         continue;
                     selected_edges.emplace_back(neighborId);
                     if (selected_edges.size() == (size_t)edge_limit)
@@ -1372,7 +948,7 @@ namespace iPreGraph_mixed
             return selected_edges;
         }
 
-        std::vector<tableint> SelectEdge(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
+        std::vector<tableint> select_intra_range_edges(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
         {
             TreeNodeMixed *cur_node = nullptr, *nxt_node = tree->root;
             std::vector<tableint> selected_edges;
@@ -1396,7 +972,7 @@ namespace iPreGraph_mixed
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -1404,16 +980,14 @@ namespace iPreGraph_mixed
                     }
                 } while (contain);
 
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
 
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
                     if (neighborId < ql || neighborId > qr)
                         continue;
-                    // if (visitedpool[neighborId] == visited_tag)
-                    //     continue;
                     if (visited_set.get(neighborId))
                         continue;
                     selected_edges.emplace_back(neighborId);
@@ -1426,7 +1000,7 @@ namespace iPreGraph_mixed
             return selected_edges;
         }
 
-        std::priority_queue<PFI> TopDown_nodeentries_search_filter(std::vector<TreeNodeMixed *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit)
+        std::priority_queue<PFI> search_post_filter(std::vector<TreeNodeMixed *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit)
         {
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
@@ -1444,7 +1018,7 @@ namespace iPreGraph_mixed
                     continue;
                 }
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -1474,11 +1048,11 @@ namespace iPreGraph_mixed
                     break;
                 candidate_set.pop();
                 int current_pid = current_point_pair.second;
-                auto selected_edges = SelectEdge(current_pid, l, r, edge_limit, visited_set);
+                auto selected_edges = select_intra_range_edges(current_pid, l, r, edge_limit, visited_set);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -1486,7 +1060,7 @@ namespace iPreGraph_mixed
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -1515,14 +1089,9 @@ namespace iPreGraph_mixed
                 top_candidates.pop();
             return top_candidates;
         }
-        // 多区间 DFS（移植 or_Pro DFS_new1）：以全部区间联合范围 [QL[0], QR[last]]
-        // 导航，flags=true 的邻居收进 edges，否则递归（deep-1）；随下潜用二分
-        // 收缩当前节点覆盖的区间子集 [left, right]。
-        // single_mode=true：区间已收缩到只剩一个（单标签块），该区间内只对应
-        // 一个查询标签、标签约束恒真——节点剪枝仅用数值（NodePruneNumeric），
-        // 收集改为 DFSMixed 风格（存在被剪兄弟子树才收集）。递归始终调用本函数
-        // （deep-1）并传播 single_mode，保证递归逻辑统一、不切换到其他函数。
-        void DFSMixedOr(std::vector<int> &QL, std::vector<int> &QR, int pid,
+        // DFS explores nonqualifying intermediates across the supplied covers.
+        // A branch reduced to one intersecting cover uses numeric MBR checks.
+        void select_cross_range_edges(std::vector<int> &QL, std::vector<int> &QR, int pid,
                         int edge_limit, int deep,
                         std::vector<tableint> &edges,
                         const iPreGraph::Bitmap &label_bmp,
@@ -1544,7 +1113,7 @@ namespace iPreGraph_mixed
             bool contain = false;
             while (cur_node)
             {
-                // 多区间模式：快速下降（进入子节点不改变联合 overlap 则继续下潜）
+                // Skip layers whose child preserves the current covering-range intersection.
                 do
                 {
                     contain = false;
@@ -1560,8 +1129,8 @@ namespace iPreGraph_mixed
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, left, right) ==
-                            GetOverLap(nxt_node->lbound, nxt_node->rbound, left, right))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, left, right) ==
+                            interval_overlap_span(nxt_node->lbound, nxt_node->rbound, left, right))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -1571,10 +1140,9 @@ namespace iPreGraph_mixed
 
                 if (single_mode)
                 {
-                    // 单区间模式（while 逐层，仿 DFSMixed）：数值剪枝当前节点，
-                    // 被剪兄弟子树（inters）才收集；区间为单标签块、标签恒真，
-                    // 不判断标签；从当前节点继续，不重复从 root 扫描。
-                    if (!NodePruneNumeric(cur_node, wq))
+                    // Inspect this layer when the sibling's numeric MBR may
+                    // contain qualifying points, then continue from this node.
+                    if (!may_match_numeric_bounds(cur_node, wq))
                         break;
                     bool inters = false;
                     if (cur_node->childs.size() == 0)
@@ -1587,7 +1155,7 @@ namespace iPreGraph_mixed
                             {
                                 nxt_node = cur_node->childs[i];
                             }
-                            else if (NodePruneNumeric(cur_node->childs[i], wq))
+                            else if (may_match_numeric_bounds(cur_node->childs[i], wq))
                             {
                                 inters = true;
                             }
@@ -1595,21 +1163,21 @@ namespace iPreGraph_mixed
                     }
                     if (inters)
                     {
-                        int *data = (int *)get_linklist(pid, cur_node->depth);
-                        size_t size = getListCount((linklistsizeint *)data);
+                        int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                        size_t size = get_neighbor_count((linklistsizeint *)data);
                         for (size_t j = 1; j <= size; ++j)
                         {
                             int neighborId = *(data + j);
                             if (neighborId < left || neighborId > right)
                                 continue;
-                            if (PointPass(neighborId, filter_map))
+                            if (point_matches_predicate(neighborId, filter_map))
                             {
                                 edges.emplace_back(neighborId);
                             }
                             else if (deep > 1)
                             {
-                                // 递归只面对该单区间（避免重新从联合范围扫描）
-                                DFSMixedOr(QL, QR, neighborId, edge_limit, deep - 1,
+                                // Recurse with the original cover arrays and one fewer hop.
+                                select_cross_range_edges(QL, QR, neighborId, edge_limit, deep - 1,
                                            edges, label_bmp, wq, node_cache, filter_map);
                             }
                             if ((int)edges.size() >= edge_limit)
@@ -1623,20 +1191,20 @@ namespace iPreGraph_mixed
                 }
                 else
                 {
-                    int *data = (int *)get_linklist(pid, cur_node->depth);
-                    size_t size = getListCount((linklistsizeint *)data);
+                    int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                    size_t size = get_neighbor_count((linklistsizeint *)data);
                     for (size_t j = 1; j <= size; ++j)
                     {
                         int neighborId = *(data + j);
                         if (neighborId < left || neighborId > right)
                             continue;
-                        if (PointPass(neighborId, filter_map))
+                        if (point_matches_predicate(neighborId, filter_map))
                         {
                             edges.emplace_back(neighborId);
                         }
                         else if (deep > 1)
                         {
-                            DFSMixedOr(QL, QR, neighborId, edge_limit, deep - 1,
+                            select_cross_range_edges(QL, QR, neighborId, edge_limit, deep - 1,
                                        edges, label_bmp, wq, node_cache, filter_map);
                         }
                         if ((int)edges.size() >= edge_limit)
@@ -1683,24 +1251,22 @@ namespace iPreGraph_mixed
                     right = QR[end_idx];
                     if (start_idx == end_idx)
                     {
-                        // 收缩到只剩一个区间（单标签块）：进入单区间模式——
-                        // 区间内只对应一个查询标签，标签约束恒真，跳过标签判断，
-                        // 仅数值剪枝。不调用其他函数：循环继续、递归仍为本函数
-                        // （模式传播），当前下降位置不重复从 root 扫描。
+                        // Continue this branch with numeric pruning after its
+                        // intersecting covers shrink to one label block.
                         single_mode = true;
                     }
                 }
             }
         }
 
-        // 多区间顶层搜索（移植 or_Pro TopDown_nodeentries_search_or_Pro，无 merge_small_gaps）：
-        //   - Q_L/Q_R 即大区间（每查询标签一个，查询预处理直接得到，无需再合并）
-        //   - 从 filterednodes（最大区间 range_filter 结果）随机取进入点
-        //   - 候选点按其所属区间 [Q_L[range_id], Q_R[range_id]] 导航取边
-        //   - 仅 flags=true 的点进入 top_candidates（结果过滤）
-        //   - 多区间时用 DFSMixedOr 跨区间补充探索
-        // id: 最大区间在 Q_L/Q_R 中的索引（range_filter 的来源）。
-        std::priority_queue<PFI> TopDown_nodeentries_search_mixed_or(
+        // Unified search over the supplied navigation covers.
+        // Q_L/Q_R contain one conservative cover per requested label.
+        // Sample entries from the tree-node cover of the largest range.
+        // Queue entries carry a range ID for direct edge selection.
+        // Only qualifying objects enter top_candidates.
+        // select_cross_range_edges supplies additional cross-range endpoints.
+        // id identifies the largest range used to obtain filterednodes.
+        std::priority_queue<PFI> search_pdg(
             std::vector<TreeNodeMixed *> &filterednodes,
             const void *query_data,
             std::vector<int> &Q_L, std::vector<int> &Q_R,
@@ -1730,13 +1296,13 @@ namespace iPreGraph_mixed
                 if (visited_set.get(pid))
                     continue;
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 ++metric_distance_computations;
                 if (top_candidates.size() < ef)
                 {
                     candidate_set.emplace(dis, pid, id);
-                    if (PointPass(pid, filter_map))
+                    if (point_matches_predicate(pid, filter_map))
                     {
                         top_candidates.emplace(dis, pid);
                         lowerBound = top_candidates.top().first;
@@ -1745,7 +1311,7 @@ namespace iPreGraph_mixed
                 else if (dis < lowerBound)
                 {
                     candidate_set.emplace(dis, pid, id);
-                    if (PointPass(pid, filter_map))
+                    if (point_matches_predicate(pid, filter_map))
                     {
                         top_candidates.emplace(dis, pid);
                         top_candidates.pop();
@@ -1770,7 +1336,7 @@ namespace iPreGraph_mixed
                 int range_id = current_point_pair.range_id;
                 if (range_id == -1)
                 {
-                    // 用 lower_bound 定位 current_pid 属于哪个区间
+                    // Locate the range containing current_pid.
                     auto it = std::lower_bound(Q_L.begin(), Q_L.end(), current_pid);
                     if (it != Q_L.end())
                     {
@@ -1782,14 +1348,14 @@ namespace iPreGraph_mixed
                         range_id = range_num - 1;
                     }
                 }
-                auto selected_edges = SelectEdgeMixedOr(current_pid, Q_L[range_id],
+                auto selected_edges = select_direct_edges(current_pid, Q_L[range_id],
                                                         Q_R[range_id], edge_limit,
                                                         visited_set, label_bmp, wq,
                                                         node_cache, filter_map);
                 int num_edges = (int)selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -1797,41 +1363,33 @@ namespace iPreGraph_mixed
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < ef)
                     {
                         candidate_set.emplace(dis, neighbor_id, range_id);
-                        // if (PointPass(neighbor_id, filter_map))
-                        // {
                         top_candidates.emplace(dis, neighbor_id);
                         lowerBound = top_candidates.top().first;
-                        // }
                     }
                     else if (dis < lowerBound)
                     {
                         candidate_set.emplace(dis, neighbor_id, range_id);
-                        // if (PointPass(neighbor_id, filter_map))
-                        // {
                         top_candidates.emplace(dis, neighbor_id);
                         top_candidates.pop();
                         lowerBound = top_candidates.top().first;
-                        // }
                     }
                 }
 
-                // if (range_num == 1)
-                //     continue;
                 std::vector<tableint> edges;
                 edges.reserve(edge_limit / 2);
-                // DFS 以 Q_L/Q_R（大区间，每查询标签一个）为输入做跨区间补充探索
-                DFSMixedOr(Q_L, Q_R, current_pid, edge_limit / 2, 2, edges,
+                // Use all per-label covers for cross-range DFS.
+                select_cross_range_edges(Q_L, Q_R, current_pid, edge_limit / 2, 2, edges,
                            label_bmp, wq, node_cache, filter_map, single_mode);
                 int num_edges1 = (int)edges.size();
                 for (int i = 0; i < std::min(num_edges1, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges1; ++i)
                 {
@@ -1839,7 +1397,7 @@ namespace iPreGraph_mixed
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < ef)
@@ -1864,25 +1422,25 @@ namespace iPreGraph_mixed
         }
 
         // ------------------------------------------------------------------------
-        // 检索入口：逐查询执行"标签集合 OR + 数值范围 AND"的近似最近邻搜索
-        // gt: [query][k] 真值（pid，混合排序后的下标）；为空则 recall 输出 -1
-        // 输出 CSV: ef,recall,qps,dco,hop
+        // Benchmark label membership AND numeric interval predicates.
+        // gt stores mixed-order IDs per query; an empty gt reports recall = -1.
+        // CSV columns: ef, recall, qps, dco, hop.
         // ------------------------------------------------------------------------
-        void search_mixed(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
+        void benchmark_pdg(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
                           const std::vector<std::vector<int>> &gt = {})
         {
             const int N = storage->data_nb;
 
             std::string savepath = saveprefix + "_mixed.csv";
             std::cout << "Savepath: " << savepath << std::endl;
-            CheckPath(savepath);
+            ensure_parent_directory(savepath);
             std::ofstream outfile(savepath);
             if (!outfile.is_open())
                 throw Exception("cannot open " + savepath);
 
             if (flags.size() < (size_t)N)
                 flags.assign(N, false);
-            storage->BuildLabelBlocks(); // 标签块边界（幂等），检索时 O(1) 取 [l,r]
+            storage->build_label_blocks(); // Ensure label-block boundaries are available.
 
             for (auto ef : SearchEF)
             {
@@ -1895,14 +1453,14 @@ namespace iPreGraph_mixed
 
                 for (int i = 0; i < storage->query_nb; i++)
                 {
-                    // 1. 标签集合：排序去重
+                    // Sort and deduplicate requested labels.
                     std::vector<int> labels = storage->query_labels[i];
                     std::sort(labels.begin(), labels.end());
                     labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
                     if (labels.empty())
                         continue;
 
-                    // 2. 查询标签位图
+                    // Build the query-label bitmap.
                     iPreGraph::Bitmap label_bitmap;
                     for (int label : labels)
                     {
@@ -1913,9 +1471,8 @@ namespace iPreGraph_mixed
                     if (label_bitmap.blocks.empty())
                         continue;
 
-                    // 3. 数值范围：查询 MBR（节点剪枝 联合盒/每标签盒 ∩ 查询MBR 用）+ 角点 z 码
-                    //    （箱角性质：盒内任意点的 z 码落在角点 z 区间 [q_z_min, q_z_max] 内，
-                    //      用于第 6 步在最小/最大标签块内收窄 [l, r] 到满足数值约束的范围）
+                    // Compute the numeric query box and Morton codes of its corners.
+                    // The corner codes bound a conservative cover, not the exact qualifying set.
                     const auto &cons = storage->query_constraints[i];
                     int num_attrs = (int)cons.attr_constraints.size();
                     iPreGraph_multi::MBR wq(num_attrs);
@@ -1928,12 +1485,12 @@ namespace iPreGraph_mixed
                         coords_max[d] = cons.attr_constraints[d].second;
                     }
                     iPreGraph_multi::MultiAttributeZCode q_z_min =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_min);
+                        iPreGraph_multi::encode_morton_key(coords_min);
                     iPreGraph_multi::MultiAttributeZCode q_z_max =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_max);
+                        iPreGraph_multi::encode_morton_key(coords_max);
 
-                    // 4. 点级混合过滤（单一数组 flags：满足全部约束 = true）：
-                    //    先按标签块置 true（标签命中），再在同一数组上做数值 AND。
+                    // Compute complete point flags within the requested label blocks.
+                    // Each point must satisfy every numeric interval.
                     std::fill(flags.begin(), flags.end(), false);
                     for (int label : labels)
                     {
@@ -1958,14 +1515,13 @@ namespace iPreGraph_mixed
                         }
                     }
 
-                    // 6. 查询前定候选区间列表 [Q_L, Q_R]（每个查询标签一个区间）：
-                    //    数据按 (label, z) 全局字典序排序、查询标签集升序，
-                    //    对每个查询标签 lab：
-                    //      l_lab = lab 块内第一个 z >= q_z_min 的点（块边界 O(1) + 块内二分）
-                    //      r_lab = lab 块内最后一个 z <= q_z_max 的点
-                    //    （角点 z 区间 [q_z_min, q_z_max] 是数值约束的安全近似：数值命中的
-                    //      点 z 必落在其内，故每区间覆盖对应标签块内全部真值点；
-                    //      多区间精确到标签，中间非查询标签块不进入候选范围。）
+                    // Generate one conservative Morton cover per requested label.
+                    // Rows are sorted by (label, Morton code), and query labels are sorted.
+                    // Within each label block, binary-search the corner-code bounds:
+                    // the first code >= q_z_min and the last code <= q_z_max.
+                    // Every numeric match lies within these bounds.
+                    // Nonmatching points inside a cover are rejected by point flags.
+                    // Unrequested label blocks are excluded from the covers.
                     timeval t1, t2;
                     gettimeofday(&t1, NULL);
                     std::vector<int> Q_L, Q_R;
@@ -1979,11 +1535,11 @@ namespace iPreGraph_mixed
                             continue;
                         int ll = (int)(std::lower_bound(storage->z_codes.begin() + bl,
                                                         storage->z_codes.begin() + br + 1, q_z_min,
-                                                        iPreGraph_multi::MultiAttributeZOrderLess) -
+                                                        iPreGraph_multi::morton_key_less) -
                                        storage->z_codes.begin());
                         int rr = (int)(std::upper_bound(storage->z_codes.begin() + bl,
                                                         storage->z_codes.begin() + br + 1, q_z_max,
-                                                        iPreGraph_multi::MultiAttributeZOrderLess) -
+                                                        iPreGraph_multi::morton_key_less) -
                                        storage->z_codes.begin()) -
                                  1;
                         if (ll <= rr)
@@ -1997,7 +1553,7 @@ namespace iPreGraph_mixed
                     if (Q_L.empty())
                     {
                         gettimeofday(&t2, NULL);
-                        searchtime += GetTime(t1, t2);
+                        searchtime += elapsed_seconds(t1, t2);
                         continue;
                     }
                     int id = 0, max_len = 0;
@@ -2009,16 +1565,16 @@ namespace iPreGraph_mixed
                             id = (int)k;
                         }
                     }
-                    std::vector<TreeNodeMixed *> node = tree->range_filter(tree->root, Q_L[id], Q_R[id]);
+                    std::vector<TreeNodeMixed *> node = tree->find_covering_nodes(tree->root, Q_L[id], Q_R[id]);
                     std::vector<uint8_t> node_cache((size_t)tree->node_count, 0);
 
-                    std::priority_queue<PFI> res = TopDown_nodeentries_search_mixed_or(
+                    std::priority_queue<PFI> res = search_pdg(
                         node, storage->query_points[i].data(), Q_L, Q_R, ef,
                         storage->query_K, edge_limit, id,
                         label_bitmap, wq,
                         node_cache, flags);
                     gettimeofday(&t2, NULL);
-                    searchtime += GetTime(t1, t2);
+                    searchtime += elapsed_seconds(t1, t2);
 
                     std::map<int, int> record;
                     while (!res.empty())
@@ -2029,7 +1585,7 @@ namespace iPreGraph_mixed
                             continue;
                         record[x] = 1;
                         total_cnt++;
-                        if (PointPass(x, flags))
+                        if (point_matches_predicate(x, flags))
                             valid_cnt++;
                         if (!gt.empty())
                         {
@@ -2052,21 +1608,21 @@ namespace iPreGraph_mixed
             }
             outfile.close();
         }
-        void search_filter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
+        void benchmark_post_filter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit,
                            const std::vector<std::vector<int>> &gt = {})
         {
             const int N = storage->data_nb;
 
             std::string savepath = saveprefix + "_filter.csv";
             std::cout << "Savepath: " << savepath << std::endl;
-            CheckPath(savepath);
+            ensure_parent_directory(savepath);
             std::ofstream outfile(savepath);
             if (!outfile.is_open())
                 throw Exception("cannot open " + savepath);
 
             if (flags.size() < (size_t)N)
                 flags.assign(N, false);
-            storage->BuildLabelBlocks(); // 标签块边界（幂等），检索时 O(1) 取 [l,r]
+            storage->build_label_blocks(); // Ensure label-block boundaries are available.
 
             for (auto ef : SearchEF)
             {
@@ -2079,14 +1635,14 @@ namespace iPreGraph_mixed
 
                 for (int i = 0; i < storage->query_nb; i++)
                 {
-                    // 1. 标签集合：排序去重
+                    // Sort and deduplicate requested labels.
                     std::vector<int> labels = storage->query_labels[i];
                     std::sort(labels.begin(), labels.end());
                     labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
                     if (labels.empty())
                         continue;
 
-                    // 2. 查询标签位图
+                    // Build the query-label bitmap.
                     iPreGraph::Bitmap label_bitmap;
                     for (int label : labels)
                     {
@@ -2097,9 +1653,9 @@ namespace iPreGraph_mixed
                     if (label_bitmap.blocks.empty())
                         continue;
 
-                    // 3. 数值范围：查询 MBR（节点剪枝 联合盒/每标签盒 ∩ 查询MBR 用）+ 角点 z 码
-                    //    （箱角性质：盒内任意点的 z 码落在角点 z 区间 [q_z_min, q_z_max] 内，
-                    //      用于第 6 步在最小/最大标签块内收窄 [l, r] 到满足数值约束的范围）
+                    // Compute the numeric query box and Morton codes of its corners.
+                    // The corner codes narrow the first and last requested label blocks.
+                    // Point flags enforce the complete predicate within the resulting cover.
                     const auto &cons = storage->query_constraints[i];
                     int num_attrs = (int)cons.attr_constraints.size();
                     iPreGraph_multi::MBR wq(num_attrs);
@@ -2112,12 +1668,12 @@ namespace iPreGraph_mixed
                         coords_max[d] = cons.attr_constraints[d].second;
                     }
                     iPreGraph_multi::MultiAttributeZCode q_z_min =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_min);
+                        iPreGraph_multi::encode_morton_key(coords_min);
                     iPreGraph_multi::MultiAttributeZCode q_z_max =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_max);
+                        iPreGraph_multi::encode_morton_key(coords_max);
 
-                    // 4. 点级混合过滤（单一数组 flags：满足全部约束 = true）：
-                    //    先按标签块置 true（标签命中），再在同一数组上做数值 AND。
+                    // Compute complete point flags within the requested label blocks.
+                    // Each point must satisfy every numeric interval.
                     std::fill(flags.begin(), flags.end(), false);
                     for (int label : labels)
                     {
@@ -2147,26 +1703,26 @@ namespace iPreGraph_mixed
                     int br = storage->label_block_end[labels[0]];
                     int l = (int)(std::lower_bound(storage->z_codes.begin() + bl,
                                                    storage->z_codes.begin() + br + 1, q_z_min,
-                                                   iPreGraph_multi::MultiAttributeZOrderLess) -
+                                                   iPreGraph_multi::morton_key_less) -
                                   storage->z_codes.begin());
                     bl = storage->label_block_start[labels.back()];
                     br = storage->label_block_end[labels.back()];
 
                     int r = (int)(std::upper_bound(storage->z_codes.begin() + bl,
                                                    storage->z_codes.begin() + br + 1, q_z_max,
-                                                   iPreGraph_multi::MultiAttributeZOrderLess) -
+                                                   iPreGraph_multi::morton_key_less) -
                                   storage->z_codes.begin()) -
                             1;
 
-                    std::vector<TreeNodeMixed *> node = tree->range_filter(tree->root, l, r);
+                    std::vector<TreeNodeMixed *> node = tree->find_covering_nodes(tree->root, l, r);
 
                     timeval t1, t2;
                     gettimeofday(&t1, NULL);
-                    std::priority_queue<PFI> res = TopDown_nodeentries_search_filter(
+                    std::priority_queue<PFI> res = search_post_filter(
                         node, storage->query_points[i].data(), l, r, ef,
                         storage->query_K, edge_limit);
                     gettimeofday(&t2, NULL);
-                    searchtime += GetTime(t1, t2);
+                    searchtime += elapsed_seconds(t1, t2);
 
                     std::map<int, int> record;
                     while (!res.empty())
@@ -2177,7 +1733,7 @@ namespace iPreGraph_mixed
                             continue;
                         record[x] = 1;
                         total_cnt++;
-                        if (PointPass(x, flags))
+                        if (point_matches_predicate(x, flags))
                             valid_cnt++;
                         if (!gt.empty())
                         {
@@ -2201,215 +1757,5 @@ namespace iPreGraph_mixed
             outfile.close();
         }
 
-        // ------------------------------------------------------------------------
-        // 检索入口（逐范围版）：标签集合 OR + 数值范围 AND
-        // 前处理与 search_mixed 完全一致（标签位图、查询 MBR、点级 flags、
-        // 候选区间列表 Q_L/Q_R）；区别在检索阶段：不再用多区间联合搜索
-        // TopDown_nodeentries_search_mixed_or，而是对每个候选区间 [Q_L[k], Q_R[k]]
-        // 单独调用单区间搜索 TopDown_nodeentries_search_mixed（区间内只含同一
-        // 标签块的点），各区间返回的（近似）前 K 候选按 pid 去重、保留最小距离，
-        // 最后全局按距离升序取前 K 作为合并结果。
-        // 注意：逐范围搜索各自维护独立的 visited_set 与 ef 预算，总开销随范围数
-        // 线性增长，用于与多区间联合版对比"每区间独立查询再合并"的开销。
-        // 输出 CSV: ef,recall,qps,dco,hop
-        // ------------------------------------------------------------------------
-        void search_mixed_per_range(std::vector<int> &SearchEF, std::string saveprefix,
-                                    int edge_limit,
-                                    const std::vector<std::vector<int>> &gt = {})
-        {
-            const int N = storage->data_nb;
-
-            std::string savepath = saveprefix + "_mixed_per_range.csv";
-            std::cout << "Savepath: " << savepath << std::endl;
-            CheckPath(savepath);
-            std::ofstream outfile(savepath);
-            if (!outfile.is_open())
-                throw Exception("cannot open " + savepath);
-
-            if (flags.size() < (size_t)N)
-                flags.assign(N, false);
-            storage->BuildLabelBlocks(); // 标签块边界（幂等），检索时 O(1) 取 [l,r]
-
-            for (auto ef : SearchEF)
-            {
-                int tp = 0;
-                int valid_cnt = 0;
-                int total_cnt = 0;
-                float searchtime = 0;
-                metric_hops = 0;
-                metric_distance_computations = 0;
-
-                for (int i = 0; i < storage->query_nb; i++)
-                {
-                    // 1. 标签集合：排序去重
-                    std::vector<int> labels = storage->query_labels[i];
-                    std::sort(labels.begin(), labels.end());
-                    labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
-                    if (labels.empty())
-                        continue;
-
-                    // 2. 查询标签位图
-                    iPreGraph::Bitmap label_bitmap;
-                    for (int label : labels)
-                    {
-                        if (label < 0)
-                            continue;
-                        label_bitmap.set(label);
-                    }
-                    if (label_bitmap.blocks.empty())
-                        continue;
-
-                    // 3. 数值范围：查询 MBR + 角点 z 码（同 search_mixed）
-                    const auto &cons = storage->query_constraints[i];
-                    int num_attrs = (int)cons.attr_constraints.size();
-                    iPreGraph_multi::MBR wq(num_attrs);
-                    std::vector<int> coords_min(num_attrs), coords_max(num_attrs);
-                    for (int d = 0; d < num_attrs; d++)
-                    {
-                        wq.min_vals[d] = cons.attr_constraints[d].first;
-                        wq.max_vals[d] = cons.attr_constraints[d].second;
-                        coords_min[d] = cons.attr_constraints[d].first;
-                        coords_max[d] = cons.attr_constraints[d].second;
-                    }
-                    iPreGraph_multi::MultiAttributeZCode q_z_min =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_min);
-                    iPreGraph_multi::MultiAttributeZCode q_z_max =
-                        iPreGraph_multi::CalculateMultiAttributeZOrder(coords_max);
-
-                    // 4. 点级混合过滤（同一数组 flags：满足全部约束 = true）
-                    std::fill(flags.begin(), flags.end(), false);
-                    for (int label : labels)
-                    {
-                        auto pp = std::equal_range(storage->labels.begin(), storage->labels.end(), label);
-                        if (pp.first == pp.second)
-                            continue;
-                        int cur_l = (int)(pp.first - storage->labels.begin());
-                        int cur_r = (int)(pp.second - storage->labels.begin()) - 1;
-                        for (int xb = cur_l; xb <= cur_r; xb++)
-                        {
-                            bool in_range = true;
-                            for (int d = 0; d < num_attrs; d++)
-                            {
-                                int v = storage->z_attrs[xb][d];
-                                if (v < cons.attr_constraints[d].first || v > cons.attr_constraints[d].second)
-                                {
-                                    in_range = false;
-                                    break;
-                                }
-                            }
-                            flags[xb] = in_range;
-                        }
-                    }
-
-                    timeval t1, t2;
-                    gettimeofday(&t1, NULL);
-                    // 5. 候选区间列表 [Q_L, Q_R]（每个查询标签一个区间，同 search_mixed）
-                    std::vector<int> Q_L, Q_R;
-                    for (int lab : labels)
-                    {
-                        if (lab < 0 || lab >= (int)storage->label_block_start.size())
-                            continue;
-                        int bl = storage->label_block_start[lab];
-                        int br = storage->label_block_end[lab];
-                        if (bl < 0 || br < bl)
-                            continue;
-                        int ll = (int)(std::lower_bound(storage->z_codes.begin() + bl,
-                                                        storage->z_codes.begin() + br + 1, q_z_min,
-                                                        iPreGraph_multi::MultiAttributeZOrderLess) -
-                                       storage->z_codes.begin());
-                        int rr = (int)(std::upper_bound(storage->z_codes.begin() + bl,
-                                                        storage->z_codes.begin() + br + 1, q_z_max,
-                                                        iPreGraph_multi::MultiAttributeZOrderLess) -
-                                       storage->z_codes.begin()) -
-                                 1;
-                        if (ll <= rr)
-                        {
-                            Q_L.push_back(ll);
-                            Q_R.push_back(rr);
-                        }
-                    }
-                    // === 优化后：K路归并 + 最大堆动态Top-K ===
-                    // 最大堆：堆顶是当前Top-K中距离最大的元素，用于快速淘汰
-                    std::priority_queue<PFI> topk_heap;
-                    // 记录已在堆中的pid及其当前最优距离，避免重复入堆
-                    std::unordered_map<int, float> in_heap;
-
-                    for (size_t k = 0; k < Q_L.size(); k++)
-                    {
-                        std::vector<TreeNodeMixed *> node = tree->range_filter(tree->root, Q_L[k], Q_R[k]);
-                        if (node.empty())
-                            continue;
-
-                        std::priority_queue<PFI> res_range = TopDown_nodeentries_search_mixed(
-                            node, storage->query_points[i].data(), Q_L[k], Q_R[k], ef,
-                            storage->query_K, edge_limit, wq, flags);
-
-                        while (!res_range.empty())
-                        {
-                            auto [dist, pid] = res_range.top();
-                            res_range.pop();
-
-                            // 剪枝1：如果堆已满且当前距离 >= 堆顶（Top-K中最大距离），直接跳过
-                            if ((int)topk_heap.size() == storage->query_K && dist >= topk_heap.top().first)
-                                continue;
-
-                            // 去重：同一pid只保留最小距离
-                            auto it = in_heap.find(pid);
-                            if (it != in_heap.end())
-                            {
-                                if (dist >= it->second)
-                                    continue;      // 不是更优解，跳过
-                                it->second = dist; // 更新为更小距离
-                            }
-                            else
-                            {
-                                in_heap[pid] = dist;
-                            }
-
-                            topk_heap.emplace(dist, pid);
-
-                            // 堆超过K时弹出最大值，保持堆大小恒为K
-                            if ((int)topk_heap.size() > storage->query_K)
-                            {
-                                auto removed = topk_heap.top();
-                                topk_heap.pop();
-                                in_heap.erase(removed.second);
-                            }
-                        }
-                    }
-                    gettimeofday(&t2, NULL);
-                    searchtime += GetTime(t1, t2);
-                    std::map<int, int> record;
-                    while (!topk_heap.empty())
-                    {
-                        auto x = topk_heap.top().second;
-                        topk_heap.pop();
-                        if (record.count(x))
-                            continue;
-                        record[x] = 1;
-                        total_cnt++;
-                        if (PointPass(x, flags))
-                            valid_cnt++;
-                        if (!gt.empty())
-                        {
-                            if (std::find(gt[i].begin(), gt[i].end(), x) != gt[i].end())
-                                tp++;
-                        }
-                    }
-                }
-
-                float recall = gt.empty() ? -1.0f
-                                          : 1.0f * tp / storage->query_nb / storage->query_K;
-                float qps = storage->query_nb / searchtime;
-                float dco = metric_distance_computations * 1.0f / storage->query_nb;
-                float hop = metric_hops * 1.0f / storage->query_nb;
-                std::cout << "ef=" << ef << " recall=" << recall << " qps=" << qps
-                          << " filter_valid=" << valid_cnt << "/" << total_cnt << std::endl;
-                outfile << ef << "," << recall << "," << qps << "," << dco << "," << hop << std::endl;
-                if (recall >= 0 && recall < 0.9f)
-                    break;
-            }
-            outfile.close();
-        }
     };
 }

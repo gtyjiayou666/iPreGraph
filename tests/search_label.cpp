@@ -11,7 +11,7 @@ int M;
 int attr_num = 3;  
 int label_col = 0; 
 
-std::vector<int> ParseEfList(const std::string &s)
+std::vector<int> parse_ef_list(const std::string &s)
 {
     
     std::vector<int> out;
@@ -75,14 +75,14 @@ int main(int argc, char **argv)
 
     iPreGraph::DataLoaderOr storage(paths["attr_json"], attr_num, label_col);
     storage.query_K = query_K;
-    storage.LoadQuery(paths["query_vector"]);
+    storage.load_query_vectors(paths["query_vector"]);
 
     iPreGraph::iPreGraph_Search_Label<float> index(paths["data_vector"], paths["index"], &storage, M);
 
     // Evaluate the configured beam widths in this order.
     std::vector<int> SearchEF = {70, 65, 60, 55, 50, 45, 40, 35, 30, 28, 26, 24, 22, 20, 18, 16, 14, 12, 10};
 
-    index.label_or(SearchEF, paths["result_saveprefix"], M,
+    index.benchmark_pdg(SearchEF, paths["result_saveprefix"], M,
        paths["label_json"], paths["groundtruth_json"]);
 
 }

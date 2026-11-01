@@ -1,4 +1,4 @@
-// Build the legacy segment-tree graph index over the input vector row order.
+// Build the segment-tree graph index over the input vector row order.
 // Inputs use a count/dimension header followed by row-major float32 vectors.
 // Attribute-dependent sorting must be completed before construction.
 
@@ -39,9 +39,9 @@ int main(int argc, char **argv)
         throw Exception("threads should be a positive integer");
 
     iPreGraph::DataLoader storage;
-    storage.LoadData(paths["data_vector"]);
+    storage.load_base_vectors(paths["data_vector"]);
     iPreGraph::iPreGraph_Build<float> index(&storage, M, ef_construction);
     index.max_threads = threads;
     // Persist graph edges using the original input row IDs.
-    index.buildandsave(paths["index_save"]);
+    index.build_and_save(paths["index_save"]);
 }

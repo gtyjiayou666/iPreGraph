@@ -56,7 +56,7 @@ namespace iPreGraph
         }
     };
 
-    float GetTime(timeval &begin, timeval &end)
+    float elapsed_seconds(timeval &begin, timeval &end)
     {
         return end.tv_sec - begin.tv_sec + (end.tv_usec - begin.tv_usec) * 1.0 / 1000000.0;
     }
@@ -148,17 +148,6 @@ namespace iPreGraph
             quad_detail::build_graphs(nodes_, edges_, vectors_, config_.M, config_.ef_construction, config_.threads, progress);
         }
 
-        // Returns original IDs satisfying the closed rectangle, with no false positives.
-        std::vector<Id> range_query(const QuadRect &range) const
-        {
-            check_range(range);
-            std::vector<Id> out;
-            if (!nodes_.empty())
-                collect(0, range, out);
-            std::sort(out.begin(), out.end());
-            return out;
-        }
-
         // Prepare eligibility before graph traversal. Fully covered tree nodes
         // need no per-point attribute checks; boundary leaves are checked once.
         FilterFlags prepare_flags(const QuadRect &range) const
@@ -206,9 +195,9 @@ namespace iPreGraph
             const auto entries = sample_entries(range, options.entry_points, options.seed);
             timeval t1, t2;
             gettimeofday(&t1, NULL);
-            auto best = TopDown_nodeentries_search(query, range, flags, ef, k, limit, options, entries);
+            auto best = search_pdg(query, range, flags, ef, k, limit, options, entries);
             gettimeofday(&t2, NULL);
-            searchtime += GetTime(t1, t2);
+            searchtime += elapsed_seconds(t1, t2);
             std::vector<Result> out;
             while (!best.empty())
             {
@@ -217,46 +206,6 @@ namespace iPreGraph
             }
             std::reverse(out.begin(), out.end());
             return out;
-        }
-
-        // Inspect the virtual query graph's adjacency for one point. The limit is
-        // global across levels; visited and repeated neighbors do not consume it.
-        std::vector<Id> select_edges(Id pid, const QuadRect &range, size_t edge_limit,
-                                     const std::unordered_set<Id> &visited = {}) const
-        {
-            check_range(range);
-            if (pid >= size())
-                fail("point ID outside index");
-            if (!edge_limit)
-                fail("edge_limit must be positive");
-            const auto flags = prepare_flags(range);
-            if (!flags[pid])
-                return {};
-            QueryVisited visited_set(size());
-            for (Id id : visited)
-                if (id < size())
-                    visited_set.set(id);
-            return select_edges_impl(pid, range, flags, edge_limit, visited_set);
-        }
-
-        // Inspect DFS cross-range candidates. Invalid points are transit vertices;
-        // only distinct, unvisited qualifying endpoints consume the shared budget.
-        std::vector<Id> select_cross_edges(Id pid, const QuadRect &range, size_t edge_limit,
-                                           unsigned hop = 2, const std::unordered_set<Id> &visited = {}) const
-        {
-            check_range(range);
-            if (pid >= size())
-                fail("point ID outside index");
-            const auto flags = prepare_flags(range);
-            QueryVisited visited_set(size());
-            for (Id id : visited)
-                if (id < size())
-                    visited_set.set(id);
-            visited_set.set(pid);
-            std::vector<Id> selected;
-            selected.reserve(std::min(edge_limit, size()));
-            DFS(pid, range, flags, edge_limit, hop, selected, visited_set);
-            return selected;
         }
 
         // Uniform sampling without replacement over eligible points. Fully covered
@@ -513,12 +462,6 @@ namespace iPreGraph
         uint32_t dimension() const { return dim_; }
         const std::vector<Node> &nodes() const { return nodes_; }
         size_t level_count() const { return edges_.size(); }
-        // O(1) row lookup. Empty if this point's leaf is above the requested level.
-        // Invalid global point IDs or levels throw std::out_of_range.
-        const std::vector<Id> &edges_at(size_t level, Id pid) const { return edges_.at(level).at(pid); }
-        const EdgeLayer &level_edges(size_t level) const { return edges_.at(level); }
-        // -1 means that the point has no tree node at this level (already a leaf).
-        int32_t node_at_level(size_t level, Id pid) const { return node_at_level_.at(level).at(pid); }
         const QuadConfig &config() const { return config_; }
         const std::vector<float> &point_vector(Id id) const { return vectors_.at(id); }
         QuadPoint point_attributes(Id id) const { return attributes_.at(id); }
@@ -558,7 +501,7 @@ namespace iPreGraph
         }
         // Heap control follows iPreGraph; direct selection is followed by the
         // two-hop cross-range DFS from search_zorder.h, on quadtree paths.
-        std::priority_queue<Result> TopDown_nodeentries_search(
+        std::priority_queue<Result> search_pdg(
             const std::vector<float> &query, const QuadRect &range, const FilterFlags &flags, size_t ef,
             size_t query_k, size_t edge_limit,
             const QuadSearchOptions &options, const std::vector<Id> &entries) const
@@ -584,7 +527,7 @@ namespace iPreGraph
                     prefetch_point(selected_edges[i]);
                 for (Id neighbor_id : selected_edges)
                 {
-                    // SelectEdge has already marked these distinct IDs visited;
+                    // select_intra_range_edges has already marked these distinct IDs visited;
                     // process every returned neighbor once, without skipping it.
                     const dist_t dis = fstdistfunc_(query.data(), vectors_[neighbor_id].data(), dist_func_param_);
                     if (top_candidates.size() < ef)
@@ -613,7 +556,7 @@ namespace iPreGraph
                 // std::vector<Id> cross_edges;
                 // const size_t cross_limit = edge_limit / 2;
                 // cross_edges.reserve(std::min(cross_limit, size()));
-                // DFS(current_pid, range, flags, cross_limit, 2, cross_edges, visited_set);
+                // select_cross_range_edges(current_pid, range, flags, cross_limit, 2, cross_edges, visited_set);
                 // process_edges(cross_edges);
             }
             while (top_candidates.size() > query_k)
@@ -695,16 +638,6 @@ namespace iPreGraph
                         fail("children do not partition their parent");
                 }
             }
-        }
-        static double distance(const std::vector<float> &a, const std::vector<float> &b)
-        {
-            double d = 0;
-            for (size_t j = 0; j < a.size(); ++j)
-            {
-                double t = double(a[j]) - b[j];
-                d += t * t;
-            }
-            return d;
         }
         QuadRect member_bounds(const std::vector<Id> &ids) const
         {
@@ -844,27 +777,6 @@ namespace iPreGraph
             }
             return ni;
         }
-        void collect(size_t ni, const QuadRect &r, std::vector<Id> &out) const
-        {
-            const Node &n = nodes_[ni];
-            if (!r.intersects(n.bounds))
-                return;
-            if (r.contains(n.bounds))
-            {
-                out.insert(out.end(), n.ids.begin(), n.ids.end());
-                return;
-            }
-            if (n.leaf())
-            {
-                for (Id id : n.ids)
-                    if (r.contains(attributes_[id]))
-                        out.push_back(id);
-            }
-            else
-                for (int32_t c : n.children)
-                    if (c >= 0)
-                        collect(c, r, out);
-        }
         void cover_nodes(size_t ni, const QuadRect &r, std::vector<size_t> &out) const
         {
             const Node &n = nodes_[ni];
@@ -948,10 +860,10 @@ namespace iPreGraph
             return selected;
         }
 
-        // Adapt search_zorder.h::DFS: each transit point starts at the root,
+        // Adapt search_zorder.h::select_cross_range_edges: each transit point starts at the root,
         // descends along its own attribute path, and skips levels whose other
         // children all miss the query. Leaves are handled by direct selection.
-        void DFS(Id pid, const QuadRect &range, const FilterFlags &flags, size_t limit,
+        void select_cross_range_edges(Id pid, const QuadRect &range, const FilterFlags &flags, size_t limit,
                  unsigned hop, std::vector<Id> &selected, QueryVisited &visited) const
         {
             if (!hop || selected.size() >= limit)
@@ -983,7 +895,7 @@ namespace iPreGraph
                         {
                             // Do not mark transit points globally: a later route
                             // may reach them with a larger remaining hop budget.
-                            DFS(id, range, flags, limit, hop - 1, selected, visited);
+                            select_cross_range_edges(id, range, flags, limit, hop - 1, selected, visited);
                         }
                         if (selected.size() >= limit)
                             return;

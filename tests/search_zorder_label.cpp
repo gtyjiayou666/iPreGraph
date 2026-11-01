@@ -2,7 +2,6 @@
 // Base rows must be ordered by (Morton code, label), matching the saved index.
 // The driver uses three columns: label in column zero, then two numerical values.
 
-#include "search_multi.h"
 #include "search_zorder_label.h"
 
 std::unordered_map<std::string, std::string> paths;
@@ -45,22 +44,22 @@ int main(int argc, char **argv)
 
     iPreGraph_multi::ZLabelDataLoader storage;
     storage.query_K = query_K;
-    storage.LoadQuery(paths["query_vector"]);
+    storage.load_query_vectors(paths["query_vector"]);
 
     std::cout << "Loaded data and query." << std::endl;
     
     // Load labels/numerical attributes and validate the required row ordering.
-    storage.LoadAttrJson(paths["attribute_file"], 0, attr_num, label_col);
+    storage.load_attributes_json(paths["attribute_file"], 0, attr_num, label_col);
 
     std::cout << "Loaded attributes." << std::endl;
     
     // Labels are alternatives (OR); all numerical intervals must hold (AND).
-    storage.LoadQueryRangeJson(paths["range_prefix"]);
+    storage.load_hybrid_predicates_json(paths["range_prefix"]);
     std::cout << "Loaded query ranges." << std::endl;   
     storage.query_K = query_K;
 
     // Ground-truth IDs refer to the sorted base-vector rows.
-    storage.LoadGroundtruthJson(paths["groundtruth_prefix"]);
+    storage.load_ground_truth_json(paths["groundtruth_prefix"]);
 
     iPreGraph_multi::iPreGraph_Search_Zorder_Label<float> index(paths["data_vector"], paths["index"], &storage, M);
     std::cout << "Loaded index." << std::endl;
@@ -68,6 +67,6 @@ int main(int argc, char **argv)
     // Evaluate the configured beam widths in this order.
     std::vector<int> SearchEF = {20};
 
-    index.search_zorder_label(SearchEF, paths["result_saveprefix"], M);
+    index.benchmark_pdg(SearchEF, paths["result_saveprefix"], M);
 
 }

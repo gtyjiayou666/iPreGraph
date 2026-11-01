@@ -8,7 +8,6 @@
 #include <queue>
 #include <random>
 #include <utility>
-// #include "segment_tree_utils.h"
 #include "multi_attribute_utils.h"
 #include "search_containers.h"
 #include "memory_utils.h"
@@ -31,9 +30,8 @@ namespace iPreGraph_multi
         SegmentTreeZorder *tree;
         size_t max_elements_{0};
         size_t dim_{0};
-        size_t attr_dim_{0}; // 属性维度（用于 Z-order / MBR / 属性过滤）
+        size_t attr_dim_{0}; // Attribute count for Morton codes, MBRs, and filtering.
         size_t M_out{0};
-        size_t ef_construction{0};
 
         size_t size_data_per_element_{0};
         size_t size_links_per_element_{0};
@@ -41,7 +39,6 @@ namespace iPreGraph_multi
 
         size_t size_links_per_layer_{0};
         size_t offsetData_{0};
-        int range_num_avg{0};
 
         char *data_memory_{nullptr};
 
@@ -62,10 +59,10 @@ namespace iPreGraph_multi
 
             max_elements_ = storage->data_nb;
             dim_ = storage->Dim;
-            attr_dim_ = storage->attr_nb; // 新字段：属性个数（不再假定为 2）
+            attr_dim_ = storage->attr_nb; // Use the loaded attribute count.
             std::cout << "attr_dim:" << attr_dim_ << std::endl;
             tree = new SegmentTreeZorder(max_elements_, attr_dim_);
-            tree->BuildTree(tree->root, storage->attributes);
+            tree->build_tree(tree->root, storage->attributes);
 
             space = new hnswlib::L2Space(dim_);
             fstdistfunc_ = space->get_dist_func();
@@ -86,9 +83,9 @@ namespace iPreGraph_multi
             {
                 for (int layer = 0; layer <= tree->max_depth; layer++)
                 {
-                    linklistsizeint *data = get_linklist(pid, layer);
+                    linklistsizeint *data = get_adjacency_list(pid, layer);
                     edgefile.read((char *)data, sizeof(tableint));
-                    int size = getListCount(data);
+                    int size = get_neighbor_count(data);
                     if (size > M_out)
                         throw Exception("real linklist size is bigger than defined M_out");
                     for (int i = 0; i < size; i++)
@@ -99,7 +96,7 @@ namespace iPreGraph_multi
                 }
 
                 size_t size_in_bytes = dim_ * sizeof(float);
-                char *data = getDataByInternalId(pid);
+                char *data = get_vector_data(pid);
                 std::memcpy(data, reinterpret_cast<char *>(storage->data_points[pid].data()), size_in_bytes);
             }
             edgefile.close();
@@ -111,22 +108,22 @@ namespace iPreGraph_multi
             data_memory_ = nullptr;
         }
 
-        inline char *getDataByInternalId(tableint internal_id) const
+        inline char *get_vector_data(tableint internal_id) const
         {
             return (data_memory_ + internal_id * size_data_per_element_ + offsetData_);
         }
 
-        linklistsizeint *get_linklist(tableint internal_id, int layer) const
+        linklistsizeint *get_adjacency_list(tableint internal_id, int layer) const
         {
             return (linklistsizeint *)(data_memory_ + internal_id * size_data_per_element_ + layer * size_links_per_layer_);
         }
 
-        int getListCount(linklistsizeint *ptr) const
+        int get_neighbor_count(linklistsizeint *ptr) const
         {
             return *((int *)ptr);
         }
 
-        int GetOverLap(int l, int r, int ql, int qr)
+        int interval_overlap_span(int l, int r, int ql, int qr)
         {
             int L = std::max(l, ql);
             int R = std::min(r, qr);
@@ -134,7 +131,7 @@ namespace iPreGraph_multi
         }
 
 
-        std::vector<tableint> SelectEdge(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
+        std::vector<tableint> select_intra_range_edges(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set)
         {
             TreeNode *cur_node = nullptr, *nxt_node = tree->root;
             std::vector<tableint> selected_edges;
@@ -158,7 +155,7 @@ namespace iPreGraph_multi
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -166,16 +163,14 @@ namespace iPreGraph_multi
                     }
                 } while (contain);
 
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
 
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
                     if (neighborId < ql || neighborId > qr)
                         continue;
-                    // if (visitedpool[neighborId] == visited_tag)
-                    //     continue;
                     if (visited_set.get(neighborId))
                         continue;
                     selected_edges.emplace_back(neighborId);
@@ -188,7 +183,7 @@ namespace iPreGraph_multi
             return selected_edges;
         }
 
-        std::vector<tableint> SelectEdgeHybrid(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set, MBR &wp, const std::vector<char> &filter_ids_map)
+        std::vector<tableint> select_direct_edges(int pid, int ql, int qr, int edge_limit, searcher::Bitset<uint64_t> &visited_set, MBR &wp, const std::vector<char> &filter_ids_map)
         {
             TreeNode *cur_node = nullptr, *nxt_node = tree->root;
             std::vector<tableint> selected_edges;
@@ -212,14 +207,14 @@ namespace iPreGraph_multi
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                         {
                             cur_node = nxt_node;
                             contain = true;
                         }
                     }
                 } while (contain);
-                if (!cur_node->mbr.Intersects(wp))
+                if (!cur_node->mbr.intersects(wp))
                 {
                     return selected_edges;
                 }
@@ -238,7 +233,7 @@ namespace iPreGraph_multi
                             }
                             else
                             {
-                                if (!cur_node->childs[i]->mbr.Intersects(wp))
+                                if (!cur_node->childs[i]->mbr.intersects(wp))
                                 {
                                     contain = true;
                                 }
@@ -250,8 +245,8 @@ namespace iPreGraph_multi
                         }
                     }
                 } while (contain);
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
                 for (size_t j = 1; j <= size; ++j)
                 {
                     int neighborId = *(data + j);
@@ -267,7 +262,7 @@ namespace iPreGraph_multi
             return selected_edges;
         }
 
-        void DFS(int pid, int ql, int qr, int edge_limit, int deep, std::vector<tableint> &edges, MBR &wp, const std::vector<char> &filter_ids_map)
+        void select_cross_range_edges(int pid, int ql, int qr, int edge_limit, int deep, std::vector<tableint> &edges, MBR &wp, const std::vector<char> &filter_ids_map)
         {
             TreeNode *cur_node = tree->root;
             TreeNode *nxt_node = nullptr;
@@ -287,7 +282,7 @@ namespace iPreGraph_multi
                             break;
                         }
                     }
-                    if (GetOverLap(cur_node->lbound, cur_node->rbound, ql, qr) == GetOverLap(nxt_node->lbound, nxt_node->rbound, ql, qr))
+                    if (interval_overlap_span(cur_node->lbound, cur_node->rbound, ql, qr) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, ql, qr))
                     {
                         cur_node = nxt_node;
                         contain = true;
@@ -297,7 +292,7 @@ namespace iPreGraph_multi
 
             while (cur_node)
             {
-                if (!cur_node->mbr.Intersects(wp))
+                if (!cur_node->mbr.intersects(wp))
                 {
                     break;
                 }
@@ -313,14 +308,12 @@ namespace iPreGraph_multi
                         if (cur_node->childs[i]->lbound <= pid && cur_node->childs[i]->rbound >= pid)
                         {
                             nxt_node = cur_node->childs[i];
-                            // continue;
                         }
                         else
                         {
-                            if (cur_node->childs[i]->mbr.Intersects(wp))
+                            if (cur_node->childs[i]->mbr.intersects(wp))
                             {
                                 inters = true;
-                                // break;
                             }
                         }
                     }
@@ -329,21 +322,18 @@ namespace iPreGraph_multi
                 if (inters)
                 {
 
-                    int *data = (int *)get_linklist(pid, cur_node->depth);
-                    size_t size = getListCount((linklistsizeint *)data);
+                    int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                    size_t size = get_neighbor_count((linklistsizeint *)data);
                     for (int j = 1; j <= size; ++j)
                     {
                         int neighborId = *(data + j);
-                        // if (neighborId < ql || neighborId > qr)
-                        //     continue;
-                        // count--;
                         if (filter_ids_map[neighborId] != 0)
                         {
                             edges.emplace_back(neighborId);
                         }
                         else if (deep > 1)
                         {
-                            DFS(neighborId, ql, qr, edge_limit, deep - 1, edges, wp, filter_ids_map);
+                            select_cross_range_edges(neighborId, ql, qr, edge_limit, deep - 1, edges, wp, filter_ids_map);
                         }
                         if (edges.size() >= edge_limit)
                         {
@@ -356,7 +346,7 @@ namespace iPreGraph_multi
         }
         int MaxStep{20};
         std::vector<double> probability;
-        void setprob()
+        void initialize_transit_probabilities()
         {
             if (MaxStep <= 0)
                 throw Exception("MaxStep must be positive");
@@ -367,10 +357,10 @@ namespace iPreGraph_multi
                 probability[x] = 1.0 / (1.0 + std::exp(x));
             }
         }
-        std::vector<std::pair<int, bool>> SelectEdgeMutil(int pid, int l, int r, int edge_limit, int current_step, searcher::Bitset<uint64_t> &visited_set, const std::vector<char> &filter_ids_map)
+        std::vector<std::pair<int, bool>> select_irange_edges(int pid, int l, int r, int edge_limit, int current_step, searcher::Bitset<uint64_t> &visited_set, const std::vector<char> &filter_ids_map)
         {
             if (MaxStep <= 0 || probability.size() != static_cast<size_t>(MaxStep))
-                setprob();
+                initialize_transit_probabilities();
             if (current_step < -1)
                 throw Exception("current_step must be at least -1");
             TreeNode *cur_node = nullptr, *nxt_node = tree->root;
@@ -395,7 +385,7 @@ namespace iPreGraph_multi
                                 break;
                             }
                         }
-                        if (GetOverLap(cur_node->lbound, cur_node->rbound, l, r) == GetOverLap(nxt_node->lbound, nxt_node->rbound, l, r))
+                        if (interval_overlap_span(cur_node->lbound, cur_node->rbound, l, r) == interval_overlap_span(nxt_node->lbound, nxt_node->rbound, l, r))
                         {
                             cur_node = nxt_node;
                             contain = true;
@@ -403,8 +393,8 @@ namespace iPreGraph_multi
                     }
                 } while (contain);
 
-                int *data = (int *)get_linklist(pid, cur_node->depth);
-                size_t size = getListCount((linklistsizeint *)data);
+                int *data = (int *)get_adjacency_list(pid, cur_node->depth);
+                size_t size = get_neighbor_count((linklistsizeint *)data);
 
                 for (size_t j = 1; j <= size; ++j)
                 {
@@ -437,7 +427,7 @@ namespace iPreGraph_multi
         // Nonqualifying transit vertices are sampled with logistic probability.
         // A qualifying point resets the transit-step counter to -1. The explicit
         // seed controls entry selection; transit sampling uses the C rand() state.
-        std::priority_queue<PFI> TopDown_nodeentries_search_mutil(
+        std::priority_queue<PFI> search_irange(
             std::vector<TreeNode *> &filterednodes, const void *query_data,
             int l, int r, int ef, int query_k, int edge_limit,
             const std::vector<char> &filter_ids_map,
@@ -448,7 +438,7 @@ namespace iPreGraph_multi
             if (filter_ids_map.size() != max_elements_)
                 throw Exception("predicate flags must match the index size");
             if (MaxStep <= 0 || probability.size() != static_cast<size_t>(MaxStep))
-                setprob();
+                initialize_transit_probabilities();
             std::priority_queue<PFI> top_candidates;
             if (l > r)
                 return top_candidates;
@@ -468,7 +458,7 @@ namespace iPreGraph_multi
                 if (visited_set.get(pid))
                     continue;
                 visited_set.set(pid);
-                const float dis = fstdistfunc_(query_data, getDataByInternalId(pid), dist_func_param_);
+                const float dis = fstdistfunc_(query_data, get_vector_data(pid), dist_func_param_);
                 if (top_candidates.size() < static_cast<size_t>(ef) || dis < lowerBound)
                 {
                     candidate_set.emplace(dis, std::make_pair(pid, -1));
@@ -491,11 +481,11 @@ namespace iPreGraph_multi
                 candidate_set.pop();
                 const int pid = current.second.first;
                 const int current_step = current.second.second;
-                auto selected = SelectEdgeMutil(pid, l, r, edge_limit, current_step, visited_set, filter_ids_map);
+                auto selected = select_irange_edges(pid, l, r, edge_limit, current_step, visited_set, filter_ids_map);
                 int num_edges = selected.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected[i].first), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected[i].first), this->prefetch_lines);
                 }
                 // Preserve selection order, as in the filter search.
                 for (int i = 0; i < num_edges; ++i)
@@ -506,7 +496,7 @@ namespace iPreGraph_multi
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    const float dis = fstdistfunc_(query_data, getDataByInternalId(neighbor_id), dist_func_param_);
+                    const float dis = fstdistfunc_(query_data, get_vector_data(neighbor_id), dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < static_cast<size_t>(ef) || dis < lowerBound)
                     {
@@ -529,11 +519,9 @@ namespace iPreGraph_multi
             return top_candidates;
         }
 
-        std::priority_queue<PFI> TopDown_nodeentries_search_zorder_and(std::vector<TreeNode *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit, MBR &wp, const std::vector<char> &filter_ids_map)
+        std::priority_queue<PFI> search_pdg(std::vector<TreeNode *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit, MBR &wp, const std::vector<char> &filter_ids_map)
         {
 
-            // timeval t1, t2, t3, t4;
-            // float searchtime1 = 0, searchtime2 = 0;
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
             std::priority_queue<PFI, std::vector<PFI>, std::greater<PFI>> candidate_set;
@@ -550,7 +538,7 @@ namespace iPreGraph_multi
                     continue;
                 }
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -580,11 +568,11 @@ namespace iPreGraph_multi
                     break;
                 candidate_set.pop();
                 int current_pid = current_point_pair.second;
-                auto selected_edges = SelectEdgeHybrid(current_pid, l, r, edge_limit, visited_set, wp, filter_ids_map);
+                auto selected_edges = select_direct_edges(current_pid, l, r, edge_limit, visited_set, wp, filter_ids_map);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -592,7 +580,7 @@ namespace iPreGraph_multi
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -612,11 +600,11 @@ namespace iPreGraph_multi
                 }
                 std::vector<tableint> edges;
                 edges.reserve(edge_limit / 2);
-                DFS(current_pid, l, r, edge_limit / 2, 2, edges, wp, filter_ids_map);
+                select_cross_range_edges(current_pid, l, r, edge_limit / 2, 2, edges, wp, filter_ids_map);
                 int num_edges1 = edges.size();
                 for (int i = 0; i < std::min(num_edges1, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges1; ++i)
                 {
@@ -624,7 +612,7 @@ namespace iPreGraph_multi
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
                     if (top_candidates.size() < ef)
@@ -642,15 +630,12 @@ namespace iPreGraph_multi
                     }
                 }
             }
-            // std::cout << "searchtime1 : " << searchtime1 << ", searchtime2 : " << searchtime2 << std::endl;
-            // std::cout << "s1 : " << s1 / count << std::endl;
-            // std::cout << "over" << std::endl;
             while (top_candidates.size() > query_k)
                 top_candidates.pop();
             return top_candidates;
         }
 
-        std::priority_queue<PFI> TopDown_nodeentries_search_zorder_and_filter(std::vector<TreeNode *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit, MBR &wp, const std::vector<char> &filter_ids_map)
+        std::priority_queue<PFI> search_post_filter(std::vector<TreeNode *> &filterednodes, const void *query_data, int l, int r, int ef, int query_k, int edge_limit, MBR &wp, const std::vector<char> &filter_ids_map)
         {
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
@@ -668,7 +653,7 @@ namespace iPreGraph_multi
                     continue;
                 }
                 visited_set.set(pid);
-                char *ep_data = getDataByInternalId(pid);
+                char *ep_data = get_vector_data(pid);
                 float dis = fstdistfunc_(query_data, ep_data, dist_func_param_);
                 if (top_candidates.size() < ef)
                 {
@@ -698,11 +683,11 @@ namespace iPreGraph_multi
                     break;
                 candidate_set.pop();
                 int current_pid = current_point_pair.second;
-                auto selected_edges = SelectEdge(current_pid, l, r, edge_limit, visited_set);
+                auto selected_edges = select_intra_range_edges(current_pid, l, r, edge_limit, visited_set);
                 int num_edges = selected_edges.size();
                 for (int i = 0; i < std::min(num_edges, 3); ++i)
                 {
-                    memory::mem_prefetch_L1(getDataByInternalId(selected_edges[i]), this->prefetch_lines);
+                    memory::mem_prefetch_L1(get_vector_data(selected_edges[i]), this->prefetch_lines);
                 }
                 for (int i = 0; i < num_edges; ++i)
                 {
@@ -710,7 +695,7 @@ namespace iPreGraph_multi
                     if (visited_set.get(neighbor_id))
                         continue;
                     visited_set.set(neighbor_id);
-                    char *neighbor_data = getDataByInternalId(neighbor_id);
+                    char *neighbor_data = get_vector_data(neighbor_id);
                     float dis = fstdistfunc_(query_data, neighbor_data, dist_func_param_);
                     ++metric_distance_computations;
 
@@ -740,9 +725,9 @@ namespace iPreGraph_multi
             return top_candidates;
         }
 
-        void search_zorder(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
+        void benchmark_pdg(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
         {
-            const int N = storage->data_nb; // 数据点总数
+            const int N = storage->data_nb; // Number of base points.
             std::vector<char> filter_ids_map(N);
             for (auto range : storage->query_range_multi)
             {
@@ -750,7 +735,7 @@ namespace iPreGraph_multi
                 std::vector<std::vector<int>> &gt = storage->ground_truth[domain];
                 std::string savepath = saveprefix + domain + "-zorder_ways.csv";
                 std::cout << "Directory: " << savepath << std::endl;
-                CheckPath(savepath);
+                ensure_parent_directory(savepath);
 
                 std::ofstream outfile(savepath);
                 if (!outfile.is_open())
@@ -758,15 +743,8 @@ namespace iPreGraph_multi
                     throw Exception("cannot open " + savepath);
                 }
 
-                std::vector<int> HOP;
-                std::vector<int> DCO;
-                std::vector<float> QPS;
-                std::vector<float> RECALL;
-
                 for (auto ef : SearchEF)
                 {
-                    int cc = 0;
-                    int cccount = 0;
                     int tp = 0;
                     float searchtime = 0;
 
@@ -776,9 +754,9 @@ namespace iPreGraph_multi
                     for (int i = storage->query_nb - 1; i >= 0; i--)
                     {
                         auto &cons = range.second[i];
-                        int num_attrs = cons.attr_constraints.size(); // 属性个数，不再硬编码为2
+                        int num_attrs = cons.attr_constraints.size(); // Query attribute count.
 
-                        // 构建 N 维 MBR
+                        // Build the query MBR across all numerical attributes.
                         MBR wq;
                         wq.dim = num_attrs;
                         wq.min_vals.resize(num_attrs);
@@ -790,8 +768,6 @@ namespace iPreGraph_multi
                         }
 
                         timeval t1, t2;
-                        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-                        std::default_random_engine e(seed);
 
                         for (int xb = 0; xb < N; xb++)
                         {
@@ -807,39 +783,37 @@ namespace iPreGraph_multi
                                 }
                             }
                             filter_ids_map[xb] = static_cast<char>(in_range);
-                            // if (in_range)
-                            //     sel_i++;
                         }
                         gettimeofday(&t1, NULL);
 
-                        // 构建 N 维 Z-order 编码的边界
+                        // Corner Morton codes give a conservative interval cover.
                         std::vector<int> coords_min(num_attrs), coords_max(num_attrs);
                         for (int d = 0; d < num_attrs; d++)
                         {
                             coords_min[d] = wq.min_vals[d];
                             coords_max[d] = wq.max_vals[d];
                         }
-                        MultiAttributeZCode z_min = CalculateMultiAttributeZOrder(coords_min);
-                        MultiAttributeZCode z_max = CalculateMultiAttributeZOrder(coords_max);
+                        MultiAttributeZCode z_min = encode_morton_key(coords_min);
+                        MultiAttributeZCode z_max = encode_morton_key(coords_max);
 
                         auto it1 = std::lower_bound(
                             storage->multi_zorder.begin(), storage->multi_zorder.end(),
-                            z_min, MultiAttributeZOrderLess);
+                            z_min, morton_key_less);
                         int l = std::distance(storage->multi_zorder.begin(), it1);
                         auto it2 = std::upper_bound(
                             storage->multi_zorder.begin(), storage->multi_zorder.end(),
-                            z_max, MultiAttributeZOrderLess);
+                            z_max, morton_key_less);
                         if (it2 != storage->multi_zorder.begin())
                             --it2;
                         int r = std::distance(storage->multi_zorder.begin(), it2);
 
-                        std::vector<TreeNode *> node = tree->range_filter(tree->root, l, r);
-                        std::priority_queue<PFI> res = TopDown_nodeentries_search_zorder_and(
+                        std::vector<TreeNode *> node = tree->find_covering_nodes(tree->root, l, r);
+                        std::priority_queue<PFI> res = search_pdg(
                             node, storage->query_points[i].data(), l, r, ef,
                             storage->query_K, edge_limit, wq, filter_ids_map);
 
                         gettimeofday(&t2, NULL);
-                        searchtime += GetTime(t1, t2);
+                        searchtime += elapsed_seconds(t1, t2);
 
                         std::map<int, int> record;
                         while (res.size())
@@ -875,9 +849,9 @@ namespace iPreGraph_multi
         // Predicate flags are cached per domain (N * query_count bytes) outside
         // the timed EF sweep. Morton bounds, entry sampling, and traversal are timed.
         // CSV columns: ef, recall, qps, distance computations/query, hops/query.
-        void search_irange(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
+        void benchmark_irange(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
         {
-            setprob();
+            initialize_transit_probabilities();
             const int N = storage->data_nb;
             if (N <= 0 || storage->query_nb <= 0 || storage->query_K <= 0 || edge_limit <= 0)
                 throw Exception("data count, query count, query_K and edge limit must be positive");
@@ -888,7 +862,7 @@ namespace iPreGraph_multi
                     throw Exception("ef must be positive");
 
             if (!std::is_sorted(storage->multi_zorder.begin(), storage->multi_zorder.end(),
-                                MultiAttributeZOrderLess))
+                                morton_key_less))
                 throw Exception("search_irange requires Morton-sorted base rows");
             for (const auto &range : storage->query_range_multi)
             {
@@ -900,7 +874,7 @@ namespace iPreGraph_multi
                     throw Exception("query ranges and ground truth must match the query count");
                 const auto &gt = gt_it->second;
                 const std::string savepath = saveprefix + domain + "-irange.csv";
-                CheckPath(savepath);
+                ensure_parent_directory(savepath);
                 std::ofstream outfile(savepath);
                 if (!outfile.is_open())
                     throw Exception("cannot open " + savepath);
@@ -960,24 +934,24 @@ namespace iPreGraph_multi
                             coords_min[d] = cons.attr_constraints[d].first;
                             coords_max[d] = cons.attr_constraints[d].second;
                         }
-                        const auto z_min = CalculateMultiAttributeZOrder(coords_min);
-                        const auto z_max = CalculateMultiAttributeZOrder(coords_max);
+                        const auto z_min = encode_morton_key(coords_min);
+                        const auto z_max = encode_morton_key(coords_max);
                         const auto first = std::lower_bound(storage->multi_zorder.begin(),
-                                                            storage->multi_zorder.end(), z_min, MultiAttributeZOrderLess);
+                                                            storage->multi_zorder.end(), z_min, morton_key_less);
                         const auto end = std::upper_bound(storage->multi_zorder.begin(),
-                                                          storage->multi_zorder.end(), z_max, MultiAttributeZOrderLess);
+                                                          storage->multi_zorder.end(), z_max, morton_key_less);
                         const int l = static_cast<int>(first - storage->multi_zorder.begin());
                         const int r = static_cast<int>(end - storage->multi_zorder.begin()) - 1;
                         std::priority_queue<PFI> res;
                         if (l <= r)
                         {
-                            auto nodes = tree->range_filter(tree->root, l, r);
-                            res = TopDown_nodeentries_search_mutil(
+                            auto nodes = tree->find_covering_nodes(tree->root, l, r);
+                            res = search_irange(
                                 nodes, storage->query_points[i].data(), l, r, ef,
                                 storage->query_K, edge_limit, filter_ids_map);
                         }
                         gettimeofday(&t2, NULL);
-                        searchtime += GetTime(t1, t2);
+                        searchtime += elapsed_seconds(t1, t2);
 
                         std::map<int, int> record;
                         while (!res.empty())
@@ -1005,9 +979,9 @@ namespace iPreGraph_multi
             }
         }
 
-        void searchfilter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
+        void benchmark_post_filter(std::vector<int> &SearchEF, std::string saveprefix, int edge_limit)
         {
-            const int N = storage->data_nb; // 数据点总数
+            const int N = storage->data_nb; // Number of base points.
             std::vector<char> filter_ids_map(N);
             for (auto range : storage->query_range_multi)
             {
@@ -1015,7 +989,7 @@ namespace iPreGraph_multi
                 std::vector<std::vector<int>> &gt = storage->ground_truth[domain];
                 std::string savepath = saveprefix + domain + "-filter.csv";
                 std::cout << "Directory: " << savepath << std::endl;
-                CheckPath(savepath);
+                ensure_parent_directory(savepath);
 
                 std::ofstream outfile(savepath);
                 if (!outfile.is_open())
@@ -1023,15 +997,8 @@ namespace iPreGraph_multi
                     throw Exception("cannot open " + savepath);
                 }
 
-                std::vector<int> HOP;
-                std::vector<int> DCO;
-                std::vector<float> QPS;
-                std::vector<float> RECALL;
-
                 for (auto ef : SearchEF)
                 {
-                    int cc = 0;
-                    int cccount = 0;
                     int tp = 0;
                     float searchtime = 0;
 
@@ -1041,9 +1008,9 @@ namespace iPreGraph_multi
                     for (int i = storage->query_nb - 1; i >= 0; i--)
                     {
                         auto &cons = range.second[i];
-                        int num_attrs = cons.attr_constraints.size(); // 属性个数，不再硬编码为2
+                        int num_attrs = cons.attr_constraints.size(); // Query attribute count.
 
-                        // 构建 N 维 MBR
+                        // Build the query MBR across all numerical attributes.
                         MBR wq;
                         wq.dim = num_attrs;
                         wq.min_vals.resize(num_attrs);
@@ -1055,8 +1022,6 @@ namespace iPreGraph_multi
                         }
 
                         timeval t1, t2;
-                        unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-                        std::default_random_engine e(seed);
 
                         for (int xb = 0; xb < N; xb++)
                         {
@@ -1075,32 +1040,32 @@ namespace iPreGraph_multi
                         }
                         gettimeofday(&t1, NULL);
 
-                        // 构建 N 维 Z-order 编码的边界
+                        // Corner Morton codes give a conservative interval cover.
                         std::vector<int> coords_min(num_attrs), coords_max(num_attrs);
                         for (int d = 0; d < num_attrs; d++)
                         {
                             coords_min[d] = wq.min_vals[d];
                             coords_max[d] = wq.max_vals[d];
                         }
-                        MultiAttributeZCode z_min = CalculateMultiAttributeZOrder(coords_min);
-                        MultiAttributeZCode z_max = CalculateMultiAttributeZOrder(coords_max);
+                        MultiAttributeZCode z_min = encode_morton_key(coords_min);
+                        MultiAttributeZCode z_max = encode_morton_key(coords_max);
 
                         auto it1 = std::lower_bound(
                             storage->multi_zorder.begin(), storage->multi_zorder.end(),
-                            z_min, MultiAttributeZOrderLess);
+                            z_min, morton_key_less);
                         int l = std::distance(storage->multi_zorder.begin(), it1);
                         auto it2 = std::upper_bound(
                             storage->multi_zorder.begin(), storage->multi_zorder.end(),
-                            z_max, MultiAttributeZOrderLess);
+                            z_max, morton_key_less);
                         if (it2 != storage->multi_zorder.begin())
                             --it2;
                         int r = std::distance(storage->multi_zorder.begin(), it2);
 
-                        std::vector<TreeNode *> node = tree->range_filter(tree->root, l, r);
-                        std::priority_queue<PFI> res = TopDown_nodeentries_search_zorder_and_filter(node, storage->query_points[i].data(), l, r, ef, storage->query_K, edge_limit, wq, filter_ids_map);
+                        std::vector<TreeNode *> node = tree->find_covering_nodes(tree->root, l, r);
+                        std::priority_queue<PFI> res = search_post_filter(node, storage->query_points[i].data(), l, r, ef, storage->query_K, edge_limit, wq, filter_ids_map);
 
                         gettimeofday(&t2, NULL);
-                        searchtime += GetTime(t1, t2);
+                        searchtime += elapsed_seconds(t1, t2);
 
                         std::map<int, int> record;
                         while (res.size())

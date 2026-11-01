@@ -33,47 +33,23 @@ namespace iPreGraph_multi
     struct MBR
     {
         int dim = 0;
-        std::vector<double> min_vals; // 各维下界
-        std::vector<double> max_vals; // 各维上界
+        std::vector<double> min_vals; // Lower bound in each dimension.
+        std::vector<double> max_vals; // Upper bound in each dimension.
 
         MBR() = default;
 
-        // 指定维度，初始化为"空"（无效）MBR
+        // Initialize an empty MBR with the requested dimension count.
         explicit MBR(int d) : dim(d)
         {
             min_vals.assign(dim, std::numeric_limits<double>::max());
             max_vals.assign(dim, std::numeric_limits<double>::lowest());
         }
 
-        // 从一对上下界构造（方便从 Attr_Constraint 直接转）
-        MBR(const std::vector<std::pair<double, double>> &bounds)
-        {
-            dim = static_cast<int>(bounds.size());
-            min_vals.reserve(dim);
-            max_vals.reserve(dim);
-            for (auto &b : bounds)
-            {
-                min_vals.push_back(b.first);
-                max_vals.push_back(b.second);
-            }
-        }
-
-        // 判空：尚未合并过任何有效区域
-        bool IsEmpty() const
-        {
-            if (dim == 0)
-                return true;
-            for (int d = 0; d < dim; d++)
-                if (min_vals[d] > max_vals[d]) // 初始化态必满足
-                    return true;
-            return false;
-        }
-
-        void Merge(const MBR &other)
+        void merge(const MBR &other)
         {
             if (dim != other.dim)
             {
-                throw Exception("MBR::Merge: dimension mismatch");
+                throw Exception("MBR::merge: dimension mismatch");
             }
             for (int d = 0; d < dim; d++)
             {
@@ -82,7 +58,7 @@ namespace iPreGraph_multi
             }
         }
 
-        bool Intersects(const MBR &other) const
+        bool intersects(const MBR &other) const
         {
             for (int d = 0; d < dim; d++)
             {
@@ -92,33 +68,6 @@ namespace iPreGraph_multi
             return true;
         }
 
-        // 点是否落在当前 MBR 内（用于属性过滤）
-        bool Contains(const std::vector<double> &p) const
-        {
-            if (dim == 0 || static_cast<int>(p.size()) != dim)
-                return false;
-            for (int d = 0; d < dim; d++)
-            {
-                if (p[d] < min_vals[d] || p[d] > max_vals[d])
-                    return false;
-            }
-            return true;
-        }
-
-        // 当前 MBR 是否完全包含 other（剪枝用：节点 MBR ⊆ 查询 MBR 时可跳过逐点过滤）
-        bool FullyContains(const MBR &other) const
-        {
-            if (dim == 0 || other.dim == 0)
-                return false;
-            if (dim != other.dim)
-                return false;
-            for (int d = 0; d < dim; d++)
-            {
-                if (min_vals[d] > other.min_vals[d] || max_vals[d] < other.max_vals[d])
-                    return false;
-            }
-            return true;
-        }
     };
 
     class TreeNode
@@ -135,17 +84,11 @@ namespace iPreGraph_multi
         }
     };
 
-    struct Point
-    {
-        int x;
-        int y;
-    };
-
     class SegmentTreeZorder
     {
     public:
         int ways_ = 2;
-        int dim_ = 2; // 新增：属性维度，必须与 DataLoader 一致
+        int dim_ = 2; // Attribute dimension count; must match DataLoader.
         TreeNode *root{nullptr};
         int max_depth{-1};
         std::vector<TreeNode *> treenodes;
@@ -156,8 +99,8 @@ namespace iPreGraph_multi
             root = new TreeNode(0, data_nb - 1, 0, dim);
         }
 
-        // attributes: N×dim 的二维数组（z-order 重排后的顺序），即 attributes[i][d] = 第 i 个点的第 d 维属性
-        void BuildTree(TreeNode *u, const std::vector<std::vector<int>> &attributes)
+        // attributes[i][d] is attribute d of row i in Z-order.
+        void build_tree(TreeNode *u, const std::vector<std::vector<int>> &attributes)
         {
             if (u == nullptr)
                 throw Exception("Tree node is a nullptr");
@@ -170,7 +113,7 @@ namespace iPreGraph_multi
 
             if (L == R)
             {
-                // 叶子：用该点的 dim 个属性值初始化 MBR（退化为一个点）
+                // A leaf's MBR is the single point's attribute vector.
                 for (int d = 0; d < dim_; d++)
                 {
                     double v = static_cast<double>(attributes[L][d]);
@@ -194,57 +137,33 @@ namespace iPreGraph_multi
                 r = std::min(r, R);
                 TreeNode *childnode = new TreeNode(l, r, u->depth + 1, dim_);
                 u->childs.emplace_back(childnode);
-                BuildTree(childnode, attributes);
+                build_tree(childnode, attributes);
                 l = r + 1;
             }
             if (L != R)
             {
                 for (const auto *child : u->childs)
-                    u->mbr.Merge(child->mbr);
+                    u->mbr.merge(child->mbr);
             }
         }
 
-        // 按 z-order 区间 [ql, qr] 筛出覆盖该区间的最少树节点集合
-        std::vector<TreeNode *> range_filter(TreeNode *u, int ql, int qr)
+        // Return the smallest set of tree nodes covering Z-order rows [ql, qr].
+        std::vector<TreeNode *> find_covering_nodes(TreeNode *u, int ql, int qr)
         {
             std::vector<TreeNode *> res;
             if (u == nullptr)
                 return res;
             if (u->lbound > qr || u->rbound < ql)
-                return res; // 区间不相交
+                return res; // Disjoint intervals.
             if (u->lbound >= ql && u->rbound <= qr)
             {
                 res.push_back(u);
                 return res;
-            } // 完全包含，整段命中
+            } // The query fully contains this node's interval.
 
             for (auto child : u->childs)
             {
-                auto t = range_filter(child, ql, qr);
-                res.insert(res.end(), t.begin(), t.end());
-            }
-            return res;
-        }
-
-        // 可选增强版：在区间过滤基础上再用 MBR 做一次空间剪枝（结果不变，只是返回的节点更少）
-        std::vector<TreeNode *> range_filter(TreeNode *u, int ql, int qr, const MBR &qmb)
-        {
-            std::vector<TreeNode *> res;
-            if (u == nullptr)
-                return res;
-            if (u->lbound > qr || u->rbound < ql)
-                return res;
-            if (!u->mbr.Intersects(qmb))
-                return res; // 新增：空间剪枝
-            if (u->lbound >= ql && u->rbound <= qr)
-            {
-                res.push_back(u);
-                return res;
-            }
-
-            for (auto child : u->childs)
-            {
-                auto t = range_filter(child, ql, qr, qmb);
+                auto t = find_covering_nodes(child, ql, qr);
                 res.insert(res.end(), t.begin(), t.end());
             }
             return res;
@@ -258,16 +177,6 @@ namespace iPreGraph_multi
             root = nullptr;
         }
     };
-    struct points
-    {
-        int left;
-        int right;
-        int num;
-        points(int left, int right, int num)
-            : left(left), right(right), num(num) {}
-    };
-    typedef std::pair<float, std::pair<int, int>> PFII;
-
     typedef std::pair<float, int> PFI;
     struct PFIORPRO
     {
@@ -286,7 +195,7 @@ namespace iPreGraph_multi
      * Ignoring array nesting keeps this reader compatible with both the
      * historical flat representation and nested debug files.
      */
-    inline std::vector<int> ReadJsonIntegers(const std::string &filename)
+    inline std::vector<int> read_json_integers(const std::string &filename)
     {
         std::ifstream infile(filename);
         if (!infile.is_open())
@@ -355,7 +264,7 @@ namespace iPreGraph_multi
      */
     // Interleave non-negative attribute bits into a multiword Morton key.
     // Use this same encoding when sorting base rows and computing query bounds.
-    inline MultiAttributeZCode CalculateMultiAttributeZOrder(
+    inline MultiAttributeZCode encode_morton_key(
         const std::vector<int> &point)
     {
         if (point.empty())
@@ -403,7 +312,7 @@ namespace iPreGraph_multi
     }
 
     /** Compare arbitrary-width Morton codes as unsigned integers. */
-    inline bool MultiAttributeZOrderLess(
+    inline bool morton_key_less(
         const MultiAttributeZCode &left,
         const MultiAttributeZCode &right)
     {
@@ -422,11 +331,6 @@ namespace iPreGraph_multi
         return false;
     }
 
-    struct TwoRangeQuery
-    {
-        int l1, r1, l2, r2;
-    };
-
     class DataLoader
     {
     public:
@@ -434,23 +338,12 @@ namespace iPreGraph_multi
         std::vector<std::vector<float>> query_points;
         int data_nb{0};
         std::vector<std::vector<float>> data_points;
-        std::vector<int> original_id;
 
         int attr_nb{0};
         std::vector<std::vector<int>> attributes;
-        std::vector<int> keys;
-        std::vector<int> vids;
-        std::vector<std::vector<int>> maxmin;
-        std::vector<int> zorder;
-        std::vector<int> lexorder;
         std::vector<MultiAttributeZCode> multi_zorder;
 
-        hnswlib::L2Space *space;
-
-        std::unordered_map<std::string, std::vector<Attr_Constraint>> query_range_or;
         std::unordered_map<std::string, std::vector<Attr_Constraint>> query_range_multi;
-        std::unordered_map<std::string, std::vector<TwoRangeQuery>> query_range_2d;
-        std::unordered_map<std::string, std::vector<std::pair<int, int>>> query_range;
         std::unordered_map<std::string, std::vector<std::vector<int>>> ground_truth;
 
         DataLoader() {}
@@ -462,7 +355,7 @@ namespace iPreGraph_multi
          */
         // Read row-major integer attributes; verify the requested column count
         // and, when supplied, the expected number of base-vector rows.
-        void LoadMultiAttributesJson(
+        void load_attributes_json(
             const std::string &filename,
             std::size_t attribute_count,
             std::size_t expected_data_count = 0)
@@ -473,7 +366,7 @@ namespace iPreGraph_multi
                     "attribute_count must be greater than zero");
             }
 
-            const std::vector<int> values = ReadJsonIntegers(filename);
+            const std::vector<int> values = read_json_integers(filename);
             if (values.size() % attribute_count != 0)
             {
                 throw std::runtime_error(
@@ -531,7 +424,7 @@ namespace iPreGraph_multi
          */
         // Read one inclusive [low, high] interval per query and attribute.
         // Attribute constraints are combined with AND by the search driver.
-        void LoadMultiRangesJson(
+        void load_numeric_predicates_json(
             const std::string &filename,
             std::size_t attribute_count,
             std::size_t expected_query_count = 0,
@@ -542,7 +435,7 @@ namespace iPreGraph_multi
                 throw std::invalid_argument(
                     "attribute_count must be greater than zero");
             }
-            const std::vector<int> values = ReadJsonIntegers(filename);
+            const std::vector<int> values = read_json_integers(filename);
             const std::size_t values_per_query = attribute_count * 2;
             if (values.size() % values_per_query != 0)
             {
@@ -616,7 +509,7 @@ namespace iPreGraph_multi
         }
 
         /** Calculate one arbitrary-width Morton code for every attribute row. */
-        void CalMultiZorder()
+        void compute_morton_codes()
         {
             multi_zorder.clear();
             multi_zorder.reserve(attributes.size());
@@ -630,20 +523,11 @@ namespace iPreGraph_multi
                         std::to_string(point));
                 }
                 multi_zorder.push_back(
-                    CalculateMultiAttributeZOrder(attributes[point]));
+                    encode_morton_key(attributes[point]));
             }
         }
 
-
-
-        float dis_compute(std::vector<float> &v1, std::vector<float> &v2)
-        {
-            hnswlib::DISTFUNC<float> fstdistfunc_ = space->get_dist_func();
-            float dis = fstdistfunc_((char *)v1.data(), (char *)v2.data(), space->get_dist_func_param());
-            return dis;
-        }
-
-        void LoadQuery(std::string filename)
+        void load_query_vectors(std::string filename)
         {
             std::ifstream infile(filename, std::ios::in | std::ios::binary);
             if (!infile.is_open())
@@ -656,18 +540,16 @@ namespace iPreGraph_multi
                 query_points[i].resize(Dim);
                 infile.read((char *)query_points[i].data(), Dim * sizeof(float));
             }
-            space = new hnswlib::L2Space(Dim);
             infile.close();
         }
 
-        void LoadData(std::string filename)
+        void load_base_vectors(std::string filename)
         {
             std::ifstream infile(filename, std::ios::in | std::ios::binary);
             if (!infile.is_open())
                 throw Exception("cannot open " + filename);
             infile.read((char *)&data_nb, sizeof(int));
             infile.read((char *)&Dim, sizeof(int));
-            // std::cout << data_nb << std::endl;
             data_points.resize(data_nb);
             for (int i = 0; i < data_nb; i++)
             {
@@ -678,74 +560,16 @@ namespace iPreGraph_multi
             infile.close();
         }
 
-
-
-
-
-        // void LoadRanges_simple(std::string saveprefix)
-        // {
-        //     std::string savepath = saveprefix + "mixed.bin";
-        //     std::ifstream infile(savepath, std::ios::in | std::ios::binary);
-        //     if (!infile.is_open())
-        //     {
-        //         throw Exception("cannot open " + savepath);
-        //     }
-        //     for (int k = 0; k < query_nb; k++)
-        //     {
-        //         int l1, r1, l2, r2;
-        //         infile.read((char *)&l1, sizeof(int));
-        //         infile.read((char *)&r1, sizeof(int));
-        //         infile.read((char *)&l2, sizeof(int));
-        //         infile.read((char *)&r2, sizeof(int));
-        //         Attr_Constraint t;
-        //         t.attr_constraints.emplace_back(l1, r1);
-        //         t.attr_constraints.emplace_back(l2, r2);
-        //         query_range["mixed"].emplace_back(t);
-        //     }
-        //     infile.close();
-        // }
-
-        /**
-         * 加载 OR 查询范围
-         * @param file_attr0 属性 0 的范围文件路径 (例如 ranges_x.csv)
-         * @param file_attr1 属性 1 的范围文件路径 (例如 ranges_y.csv)
-         * @param query_key 存入 map 的键名 (例如 "mixed")
-         */
-
-
-
-
-
-        void LoadGroundtruth(std::string saveprefix)
-        {
-            for (auto t : query_range_2d)
-            {
-                std::string domain = t.first;
-                std::string savepath = saveprefix + domain + ".bin";
-                std::ifstream infile(savepath, std::ios::in | std::ios::binary);
-                if (!infile.is_open())
-                {
-                    throw Exception("cannot open " + savepath);
-                }
-                ground_truth[domain].resize(query_nb);
-                for (int qid = 0; qid < query_nb; qid++)
-                {
-                    ground_truth[domain][qid].resize(query_K);
-                    infile.read((char *)ground_truth[domain][qid].data(), query_K * sizeof(int));
-                }
-                infile.close();
-            }
-        }
         /**
          * Load ground truth produced by the generator.
          * Layout (flat integer list): [q0_id0, q0_id1, ..., q0_id(K-1),
          *                              q1_id0, ..., q(N-1)_id(K-1)]
          * One file per domain; the domain name is taken from query_key.
          */
-        void LoadGroundtruthJson(const std::string &filename,
+        void load_ground_truth_json(const std::string &filename,
                                  const std::string &query_key = "mixed")
         {
-            const std::vector<int> values = ReadJsonIntegers(filename);
+            const std::vector<int> values = read_json_integers(filename);
             if (values.empty())
             {
                 throw std::runtime_error("ground truth file is empty: " + filename);
@@ -794,6 +618,5 @@ namespace iPreGraph_multi
                       << filename << std::endl;
         }
     };
-
 
 }

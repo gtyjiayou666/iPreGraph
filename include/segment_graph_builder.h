@@ -39,7 +39,7 @@ namespace iPreGraph
             fstdistfunc_ = space->get_dist_func();
             dist_func_param_ = space->get_dist_func_param();
             tree = new SegmentTree(storage->data_nb);
-            tree->BuildTree(tree->root);
+            tree->build_tree(tree->root);
             edges.resize(storage->data_nb);
             for (int i = 0; i < storage->data_nb; i++)
             {
@@ -48,12 +48,12 @@ namespace iPreGraph
             visitedpool.resize(storage->data_nb);
         }
 
-        float dis_compute(std::vector<float> &v1, std::vector<float> &v2)
+        float compute_distance(std::vector<float> &v1, std::vector<float> &v2)
         {
             return fstdistfunc_(v1.data(), v2.data(), dist_func_param_);
         }
 
-        void copyfirstchild(TreeNode *u)
+        void copy_first_child_edges(TreeNode *u)
         {
             TreeNode *firstchild = u->childs[0];
             for (int id = firstchild->lbound; id <= firstchild->rbound; id++)
@@ -64,7 +64,7 @@ namespace iPreGraph
             }
         }
 
-        std::priority_queue<PFI> search_on_incomplete_graph(TreeNode *u, std::vector<float> &query_point, int ef, int query_k, std::vector<int> enterpoints)
+        std::priority_queue<PFI> search_partial_graph(TreeNode *u, std::vector<float> &query_point, int ef, int query_k, std::vector<int> enterpoints)
         {
             size_t local_tag;
             {
@@ -78,7 +78,7 @@ namespace iPreGraph
 
             for (auto pid : enterpoints)
             {
-                float dis = dis_compute(query_point, storage->data_points[pid]);
+                float dis = compute_distance(query_point, storage->data_points[pid]);
                 visitedpool[pid] = local_tag;
                 pool.emplace(dis, pid);
                 candidates.emplace(dis, pid);
@@ -103,7 +103,7 @@ namespace iPreGraph
                     if (visitedpool[neighborId] == local_tag)
                         continue;
                     visitedpool[neighborId] = local_tag;
-                    float dis = dis_compute(query_point, storage->data_points[neighborId]);
+                    float dis = compute_distance(query_point, storage->data_points[neighborId]);
                     if (candidates.size() < ef || dis < lowerBound)
                     {
                         candidates.emplace(dis, neighborId);
@@ -126,7 +126,7 @@ namespace iPreGraph
             return candidates;
         }
 
-        std::vector<PFI> PruneByHeuristic2(std::vector<PFI> &old_list, std::vector<PFI> &new_list)
+        std::vector<PFI> prune_neighbor_candidates(std::vector<PFI> &old_list, std::vector<PFI> &new_list)
         {
             std::priority_queue<PFI, std::vector<PFI>, std::greater<PFI>> queue_closest;
             std::vector<PFI> return_list;
@@ -169,7 +169,7 @@ namespace iPreGraph
                     if (current_old && return_list_belong_to_lowerlayer_list[i])
                         continue;
                     auto second_pair = return_list[i];
-                    float curdist = dis_compute(storage->data_points[current_pair.second], storage->data_points[second_pair.second]);
+                    float curdist = compute_distance(storage->data_points[current_pair.second], storage->data_points[second_pair.second]);
                     if (curdist < dist_to_pid)
                     {
                         good = false;
@@ -190,7 +190,7 @@ namespace iPreGraph
             if (u->childs.size() == 0)
                 return;
 
-            copyfirstchild(u);
+            copy_first_child_edges(u);
             int merged_point_num = u->childs[0]->rbound - u->childs[0]->lbound + 1;
             unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
             std::default_random_engine e(seed);
@@ -208,13 +208,13 @@ namespace iPreGraph
                         enterpoints.emplace_back(enterpid);
                     }
 
-                    auto search_result = search_on_incomplete_graph(u, storage->data_points[pid], ef_construction, ef_construction, enterpoints);
+                    auto search_result = search_partial_graph(u, storage->data_points[pid], ef_construction, ef_construction, enterpoints);
                     while (search_result.size())
                     {
                         edges[pid][u->depth].emplace_back(search_result.top());
                         search_result.pop();
                     }
-                    edges[pid][u->depth] = PruneByHeuristic2(edges[pid][cur_child->depth], edges[pid][u->depth]);
+                    edges[pid][u->depth] = prune_neighbor_candidates(edges[pid][cur_child->depth], edges[pid][u->depth]);
                 }
 
                 for (int j = 0; j < merged_point_num; j++)
@@ -238,14 +238,14 @@ namespace iPreGraph
                 for (int j = 0; j < merged_point_num; j++)
                 {
                     int pid = u->lbound + j;
-                    edges[pid][u->depth] = PruneByHeuristic2(edges[pid][u->depth], reverse_edges[pid]);
+                    edges[pid][u->depth] = prune_neighbor_candidates(edges[pid][u->depth], reverse_edges[pid]);
                 }
 
                 merged_point_num += cur_child->rbound - cur_child->lbound + 1;
             }
         }
 
-        void buildindex()
+        void build_graphs()
         {
             std::vector<std::vector<TreeNode *>> level_nodes;
             level_nodes.resize(tree->max_depth + 1);
@@ -286,18 +286,18 @@ namespace iPreGraph
             }
         }
 
-        void buildandsave(std::string indexpath)
+        void build_and_save(std::string indexpath)
         {
-            CheckPath(indexpath);
+            ensure_parent_directory(indexpath);
             std::ofstream indexfile(indexpath, std::ios::out | std::ios::binary);
             if (!indexfile.is_open())
                 throw Exception("cannot open " + indexpath);
             reverse_edges.resize(storage->data_nb);
             timeval t1, t2;
             gettimeofday(&t1, NULL);
-            buildindex();
+            build_graphs();
             gettimeofday(&t2, NULL);
-            double construction_time = GetTime(t1, t2);
+            double construction_time = elapsed_seconds(t1, t2);
 
             std::cout << "construction time:" << construction_time << "s" << std::endl;
 

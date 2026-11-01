@@ -1,7 +1,7 @@
 // Standalone benchmark for label OR and numerical range AND predicates.
 // Base rows must be ordered by (label, Morton code). A query contains a label
 // list followed by one [low, high] pair per numerical attribute.
-// This source is not currently registered as a CMake executable target.
+// Built as the search_mixed executable by tests/CMakeLists.txt.
 
 #include "search_mixed.h"
 
@@ -18,7 +18,7 @@ int M;
 int attr_num = 3;  
 int label_col = 0; 
 
-std::vector<int> ParseEfList(const std::string &s)
+std::vector<int> parse_ef_list(const std::string &s)
 {
     
     std::vector<int> out;
@@ -82,19 +82,19 @@ int main(int argc, char **argv)
 
     iPreGraph_mixed::MixedDataLoader storage;
     // Load labels/numerical attributes and validate the required row ordering.
-    storage.LoadAttrJson(paths["attr_json"], 0, attr_num, label_col);
+    storage.load_attributes_json(paths["attr_json"], 0, attr_num, label_col);
 
     // Labels are alternatives (OR); all numerical intervals must hold (AND).
-    storage.LoadQueryRangeJson(paths["query_json"]);
+    storage.load_hybrid_predicates_json(paths["query_json"]);
     storage.query_K = query_K;
 
-    storage.LoadQuery(paths["query_vector"]);
+    storage.load_query_vectors(paths["query_vector"]);
     if ((int)storage.query_labels.size() != storage.query_nb)
         throw Exception("query_json query count != query vector count");
 
     std::vector<std::vector<int>> gt;
     if (!paths["groundtruth_json"].empty())
-        gt = iPreGraph_mixed::MixedDataLoader::LoadGtJson(
+        gt = iPreGraph_mixed::MixedDataLoader::load_ground_truth_json(
             paths["groundtruth_json"], storage.query_nb, query_K);
 
     iPreGraph_mixed::iPreGraph_Search_Mixed<float> index(
@@ -103,6 +103,6 @@ int main(int argc, char **argv)
     // Evaluate the configured beam widths in this order.
     std::vector<int> SearchEF = {40, 35, 30, 25, 20, 18, 16, 14, 12, 10};
 
-    index.search_mixed(SearchEF, paths["result_saveprefix"], M, gt);
+    index.benchmark_pdg(SearchEF, paths["result_saveprefix"], M, gt);
     
 }
